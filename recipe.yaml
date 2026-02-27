@@ -1,0 +1,153 @@
+# ============================================================================
+# recipe.yaml - 凝胶电解质配方与模拟条件定义文件
+# ============================================================================
+# 所有组分按 wt% (质量百分比) 输入，8 类总和必须等于 100%
+#
+# 固定顺序（8 类）：
+#   1) salt_solution     - 盐溶液（锂盐+溶剂等）
+#   2) polymer_matrix    - 聚合物基质
+#   3) crosslinker       - 交联剂
+#   4) photoinitiator    - 引发剂（如有）
+#   5) plasticizer_solvent - 增塑剂/溶剂（可选）
+#   6) functional_monomer  - 功能单体（可选）
+#   7) stabilizer        - 稳定剂（可选）
+#   8) functional_filler - 功能填料（可选）
+#
+# 每个条目必须包含：
+#   - name: 缩写（中文全称）（如 "LiTFSI（双三氟甲磺酰亚胺锂）"）
+#   - wt_pct: 质量百分比
+#   - kind: 物质类型（salt/solvent/polymer/monomer/initiator/filler 等）
+#
+# 可选字段：
+#   - mw_g_mol: 分子量 (g/mol)
+#   - atoms_per_entity: 每个分子/实体的原子数
+#   - structure_file: 结构文件路径（.xyz/.pdb/.cif 等）
+#   - min_count: 最小分子数（用于 recipe_to_counts，默认 0）
+# ============================================================================
+
+# ======================= 模拟条件 =======================
+simulation:
+  # ---------- 模拟模式 ----------
+  mode: aimd              # aimd (分子动力学) / static (静态计算)
+
+  # ---------- 温度设置（摄氏度）----------
+  temperature_C: 60       # 自动转换为 K: T_K = T_C + 273.15
+
+  # ---------- 时间参数 ----------
+  dt_fs: 1.0              # 时间步长 (fs) = POTIM (含 H 建议 0.5-1.0)
+  nsteps: 10000           # 总步数 = NSW
+
+  # ---------- 系综与恒温器 ----------
+  ensemble: nvt           # nvt (正则系综) / nve (微正则系综)
+  thermostat: langevin    # langevin / nose_hoover
+
+  # Langevin 摩擦系数 (1/ps)
+  # ⚠️ gamma 过大会抑制真实动力学！
+  #    - 平衡段建议: 10-20 (快速控温)
+  #    - 生产段建议: 1-5 (弱耦合，保留真实扩散)
+  gamma_1ps: 10.0         # 单一 INCAR 时使用
+
+  # 两段式参数（用于 --two_stage）
+  gamma_eq_1ps: 10.0      # 平衡段 gamma
+  gamma_prod_1ps: 5.0     # 生产段 gamma
+  nsteps_eq: 2000         # 平衡段步数（默认为 nsteps 的 1/5）
+
+  smass: -3               # Nosé-Hoover 质量参数，-3=自动
+
+  # ---------- 电子步参数 ----------
+  nelm: 100
+  ediff: 1.0e-5
+
+  # ---------- AIMD 稳定性参数 ----------
+  isym: 0                 # AIMD 必须关闭对称性！
+  maxmix: 40              # 电荷密度混合历史，建议 40-80
+
+  # ---------- 建模相关参数 ----------
+  # ⚠️ density 仅用于建盒子/Packmol/recipe_to_counts，非 VASP 参数
+  # ⚠️ AIMD 代表性小胞可能无法严格保持实验 wt%
+  density_g_cm3: 1.25
+  builder: none           # none / packmol
+  target_atoms: 200       # AIMD 小体系目标原子数
+
+  # 允许小体系中 optional 组分 count=0
+  allow_drop_low_fraction_components: true
+
+  # ---------- 可选：截断能 ----------
+  # encut: 400            # 如不指定，需在 INCAR.base 中提供
+
+  # ---------- 可选：两段式阶段定义 ----------
+  # 如需更细粒度控制，可定义 stages 列表
+  # stages:
+  #   - name: eq
+  #     nsteps: 2000
+  #     gamma_1ps: 15.0
+  #   - name: prod
+  #     nsteps: 10000
+  #     gamma_1ps: 3.0
+
+# ======================= 主要组分（四大类）=======================
+
+# 1) 盐溶液 - Salt Solution
+salt_solution:
+  - name: "LiTFSI（双三氟甲磺酰亚胺锂）"
+    wt_pct: 15.0
+    kind: salt
+    mw_g_mol: 287.09
+    atoms_per_entity: 15
+    structure_file: structures/LiTFSI.xyz
+    min_count: 1          # 至少保留 1 个
+
+  - name: "EC（碳酸乙烯酯）"
+    wt_pct: 10.0
+    kind: solvent
+    mw_g_mol: 88.06
+    atoms_per_entity: 10
+    structure_file: structures/EC.xyz
+
+  - name: "DMC（碳酸二甲酯）"
+    wt_pct: 10.0
+    kind: solvent
+    mw_g_mol: 90.08
+    atoms_per_entity: 12
+    structure_file: structures/DMC.xyz
+
+# 2) 聚合物基质 - Polymer Matrix
+polymer_matrix:
+  - name: "PEGDA（聚乙二醇二丙烯酸酯）"
+    wt_pct: 40.0
+    kind: polymer
+    mw_g_mol: 575.0
+    atoms_per_entity: 82
+    structure_file: structures/PEGDA.xyz
+
+# 3) 交联剂 - Crosslinker
+crosslinker:
+  - name: "TMPTA（三羟甲基丙烷三丙烯酸酯）"
+    wt_pct: 20.0
+    kind: crosslinker
+    mw_g_mol: 296.32
+    atoms_per_entity: 44
+    structure_file: structures/TMPTA.xyz
+
+# 4) 引发剂 - Photoinitiator
+photoinitiator:
+  - name: "Irgacure 819（双(2,4,6-三甲基苯甲酰基)苯基氧化膦）"
+    wt_pct: 5.0
+    kind: initiator
+    mw_g_mol: 418.46
+    atoms_per_entity: 57
+    structure_file: structures/Irgacure819.xyz
+
+# ======================= 可选组分（四类，可为空）=======================
+
+# 5) 增塑剂/溶剂 - Plasticizer/Solvent (可选)
+plasticizer_solvent: []
+
+# 6) 功能单体 - Functional Monomer (可选)
+functional_monomer: []
+
+# 7) 稳定剂 - Stabilizer (可选)
+stabilizer: []
+
+# 8) 功能填料 - Functional Filler (可选)
+functional_filler: []

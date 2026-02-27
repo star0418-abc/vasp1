@@ -1,0 +1,47 @@
+# ============================================================================
+# minimal_recipe.yaml - 最小化配方示例（用于测试）
+# ============================================================================
+# 注意：这是一个简化示例，实际使用时请修改为真实配方
+# ============================================================================
+
+simulation:
+  mode: aimd
+  temperature_C: 60
+  dt_fs: 1.0
+  nsteps: 1000
+  ensemble: nvt
+  thermostat: langevin
+  gamma_1ps: 10.0
+  isym: 0
+  maxmix: 40
+  target_atoms: 100
+
+# 主要组分（简化示例，总和 = 100%）
+salt_solution:
+  - name: "LiTFSI（双三氟甲磺酰亚胺锂）"
+    wt_pct: 20.0
+    kind: salt
+    mw_g_mol: 287.09
+    atoms_per_entity: 15
+
+polymer_matrix:
+  - name: "PEGDA（聚乙二醇二丙烯酸酯）"
+    wt_pct: 50.0
+    kind: polymer
+    mw_g_mol: 575.0
+    atoms_per_entity: 82
+
+crosslinker:
+  - name: "TMPTA（三羟甲基丙烷三丙烯酸酯）"
+    wt_pct: 30.0
+    kind: crosslinker
+    mw_g_mol: 296.32
+    atoms_per_entity: 44
+
+# 以下为空
+photoinitiator: []
+plasticizer_solvent: []
+functional_monomer: []
+stabilizer: []
+functional_filler: []
+

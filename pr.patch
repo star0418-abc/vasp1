@@ -1,0 +1,73 @@
+diff --git a/setup_aimd_ase.py b/setup_aimd_ase.py
+index dcbe5f4e46020cecba20556910f017a8a0432264..2aa67dcae1f2e45908b29af8e952e7b590663162 100644
+--- a/setup_aimd_ase.py
++++ b/setup_aimd_ase.py
+@@ -658,52 +658,67 @@ def neutralize_by_residue(
+     current_charge: int,
+     target_charge: int,
+     all_distances: np.ndarray,
+     mic_vectors: np.ndarray
+ ) -> Tuple[np.ndarray, int, List[str]]:
+     """
+     按残基/分子中和电荷
+     
+     Returns:
+         new_indices: 添加反离子后的索引
+         added_count: 添加的原子数
+         info: 信息列表
+     """
+     if current_charge == target_charge:
+         return selected_indices, 0, []
+     
+     resnames, resids = get_residue_info(atoms)
+     positions = atoms.get_positions()
+     center_pos = positions[center_idx]
+     # 使用安全的晶胞检查
+     cell = atoms.cell if has_valid_cell(atoms) else None
+     
+     info = []
+     
+     if resnames is not None and resids is not None and HAS_UTILS:
+-        # 按残基中和
++        # 确保选中集合不包含残基的“半截”
+         selected_set = set(selected_indices)
++        residue_groups: Dict[Tuple[str, int], Set[int]] = {}
++        for idx, (resname, resid) in enumerate(zip(resnames, resids)):
++            residue_groups.setdefault((resname, resid), set()).add(idx)
++
++        expanded_selected = set()
++        for (resname, resid), indices in residue_groups.items():
++            if indices & selected_set:
++                expanded_selected.update(indices)
++
++        if expanded_selected != selected_set:
++            selected_set = expanded_selected
++            selected_indices = np.array(sorted(selected_set))
++            info.append("[INFO] 已将选中集合扩展为完整残基，避免部分残基参与中和")
++
++        # 按残基中和
+         counterion_groups, remaining = find_counterion_residues(
+             resnames, resids, selected_set,
+             current_charge, target_charge,
+             positions, center_pos, cell
+         )
+         
+         added_indices = []
+         for group in counterion_groups:
+             added_indices.extend(group)
+             # 获取残基名称
+             if group:
+                 idx = list(group)[0]
+                 rname = resnames[idx] if idx < len(resnames) else "?"
+                 info.append(f"添加残基 {rname} ({len(group)} 原子)")
+         
+         if added_indices:
+             new_indices = np.concatenate([selected_indices, np.array(added_indices)])
+             new_indices = np.unique(new_indices)
+             return new_indices, len(added_indices), info
+     
+     # 回退：按元素（单原子）中和
+     info.append("[WARN] 无残基信息，按元素原子中和（可能不准确）")
+     
+     symbols = atoms.get_chemical_symbols()
+     selected_set = set(selected_indices)
