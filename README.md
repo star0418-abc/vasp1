@@ -795,6 +795,7 @@ MTO MSD 公式:
 - `msd_report.txt` 现在包含重复帧去重摘要、COM 参考来源、strict 标志、cell check 消息以及最终 `SUMMARY` 机器可读行。
 - Einstein 分母支持显式维度 `d`：`D = slope / (2d)`（默认 `d=3`，2D 体系可用 `--diff_dim 2`）。
 - `--runningD` 与 `--plateau_method` 现在会真实控制计算/写出/判定路径，不再总是固定走 “both”。
+- `D_derivative` 平台判定阈值保持为 `drift_ratio < 0.2`（20%）作为默认经验判据。
 
 > ⚠️ **重要 (v2.3)**：严格模式下，只有当启用了 alpha 判定（`--plateau_method alpha/both`）且检测到亚扩散（α < 0.8）时，脚本才会将 D 设为 NaN 并以退出码 2 终止。其他不可靠原因（如 drifting/α不可用）不会被误标为 subdiffusion exit(2)。
 
