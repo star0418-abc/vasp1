@@ -942,7 +942,7 @@ step,raw_step,segment,E0_eV,T_K,F_eV
 > 平衡期建议是**仅供参考**的建议，不会自动应用。必须使用 `--t_skip_ps` 或 `--t_skip_steps` 显式指定才会生效。
 > 若 `--t_skip_steps/--t_skip_ps` 覆盖了全部数据，脚本会保留全量 CSV，但生产段统计为空，漂移会报告数据不足。
 
-### make_incar_aimd.py 功能 (v3.0.2)
+### make_incar_aimd.py 功能 (v3.0.2+)
 
 **基础功能**：
 - 从 recipe.yaml 读取模拟条件
@@ -952,22 +952,26 @@ step,raw_step,segment,E0_eV,T_K,F_eV
 - 添加 `LASPH = .TRUE.` 和 `ADDGRID = .TRUE.`
 - 支持 INCAR.base 继承
 
-**v3.0.2 关键改进**：
+**最新关键改进（正确性/一致性）**：
 - ✅ **修复恒温器映射（关键物理修复）**：
   - Langevin: `MDALGO = 3` + `LANGEVIN_GAMMA` 向量
   - Nosé-Hoover: `MDALGO = 2` + `SMASS`
-- ✅ **鲁棒 POSCAR 解析**：支持 VASP4/VASP5/Selective dynamics
+- ✅ **鲁棒 POSCAR 解析**：支持 VASP4/VASP5/Selective dynamics，首行注释可为空
 - ✅ **LANGEVIN_GAMMA 输出向量**：每种原子类型一个值（VASP 要求）
-- ✅ **dt_fs 可选且 `null` 安全**：未指定或 `dt_fs: null` 时根据 H 检测自动设置
+- ✅ **`simulation.has_h` 严格布尔归一化**：支持 `true/false/0/1`，非法值会明确报错
+- ✅ **`dt_fs` 可选且 `null` 安全**：未指定、`dt_fs: null`、`dt_fs: \"null\"` 都会按“未指定”处理
+- ✅ **拒绝非有限数值**：`temperature_C/dt_fs/gamma_1ps/smass/ediff/...` 中的 `NaN/Inf/-Inf` 直接报错
 - ✅ **两段式 prod 预生成重启意图**：默认 `ISTART=1, ICHARG=0`（不在生成时检查 WAVECAR）
-- ✅ **ALGO/LREAL/LWAVE/LCHARG 确定性优先级**：stage > global > INCAR.base > 默认值
+- ✅ **ALGO/LREAL/LWAVE/LCHARG 确定性优先级**：stage > global > INCAR.base > 默认值（`null` 不会截断回退链）
 - ✅ **gamma 键名兼容增强**：支持 `gamma_list_eq_1ps` 和 `gamma_eq_list_1ps` 两种风格
 - ✅ **高 gamma 保护**：`max(gamma) >= 50` 默认硬错误（可用 `allow_high_gamma: true` 放行）
 - ✅ **INCAR.base 多参数解析**：支持 `A=1 ; B=2`，重复键后者覆盖前者
-- ✅ **未知 H 检测采用安全默认**：POSCAR/POTCAR 都无法判断时按“含 H”处理，避免静默使用过大的 `POTIM`
+- ✅ **H 检测回退增强**：POTCAR 可识别 `H_h/H_s/H.5` 等常见变体；扫描不确定时走安全默认而非误判“无 H”
 - ✅ **thermostat 别名规范化**：`nose` / `nose-hoover` / `nh` 都会规范化为 `nose_hoover`
 - ✅ **两段式摘要按阶段分别打印**：EQ / PROD 会分别显示各自的 gamma、`dt_fs`、`ISTART/ICHARG`、`LWAVE/LCHARG`
 - ✅ **INCAR 头部 traceability**：自动写入 `has_h` 来源、`dt_fs resolved_by`、`ISTART/ICHARG resolved_by`
+- ✅ **`simulation.stages` 优先级修正**：只要定义了 `simulation.stages`，即使未传 `--two_stage` 也按 stages 生成
+- ✅ **`NBLOCK/KBLOCK` 显式处理**：不再隐式继承；会写入 INCAR 与摘要/警告，避免下游时间轴误读
 
 > [!IMPORTANT]
 > **LANGEVIN_GAMMA 必须是向量**，每种原子类型（NTYP）一个值。
@@ -986,9 +990,10 @@ simulation:
   # 如不指定：含 H → POTIM=1.0 fs，否则 → POTIM=2.0 fs
   dt_fs: 1.0              # 时间步长 (fs)
   # dt_fs: null           # 与省略等效：自动按 has_h 规则解析
+  # dt_fs: "null"         # 也会按“未指定”处理（常见占位符兼容）
   
   # === 可选：强制 H 检测结果 ===
-  # has_h: true           # 覆盖自动检测
+  # has_h: true           # 覆盖自动检测（支持 true/false/0/1）
   
   # === 恒温器 ===
   thermostat: langevin    # langevin / nose_hoover / nose / nose-hoover / nh
@@ -1045,14 +1050,29 @@ simulation:
   # lcharg_prod: true
   
   # === 其他 ===
-  smass: -3               # Nosé-Hoover 质量参数
+  smass: -3               # Nosé-Hoover 默认参数（保留现有策略）
   nelm: 100
   ediff: 1.0e-5
   maxmix: 40
+  # nblock: 2             # 可选：显式输出步频控制（影响轨迹时间轴）
+  # kblock: 1             # 可选：显式输出步频控制（影响轨迹时间轴）
   # encut: 400            # 如不指定，需在 INCAR.base 中提供
 ```
 
+> [!IMPORTANT]
+> 在 `simulation.stages` 模式中，阶段步数请使用 `stage.nsteps`。  
+> `nsteps_eq` / `nsteps_prod` 在 stages 模式下会报错，避免阶段意图被静默忽略。
+
 ### 两段式 AIMD（平衡/生产分离）
+
+- 若 `simulation.stages` 已定义：脚本会优先按 YAML stages 逐段生成（即使未传 `--two_stage`）
+- 若同时传 `--two_stage` 且存在 `simulation.stages`：会打印提示并以 YAML stages 为准
+- `simulation.stages` 必须是非空列表；`null` 或 `[]` 会直接报错（避免静默回退到单阶段）
+- 自定义阶段名（非 `eq/prod`）在多阶段模式下会按顺序赋予默认 profile：
+  - 第一段按 `eq` 默认
+  - 其余阶段按 `prod` 默认
+  - 终端和 INCAR 头部会写出 `stage_profile` 便于追溯
+- 单阶段自定义 stage 不会强制套用 `eq/prod` profile 默认
 
 ```bash
 # 生成两段式 INCAR
@@ -1082,7 +1102,7 @@ python3 aimd_msd.py --specie Li --dt_fs 1.0
 >
 > 若无 WAVECAR，请把 `INCAR.prod` 改为 `ISTART=0, ICHARG=2` 再运行。
 
-### POTIM / dt_fs 语义（v3.0.2）
+### POTIM / dt_fs 语义（v3.0.2+）
 
 - `dt_fs` 现在是**可选**的（v2.x 版本曾要求必填）
 - `dt_fs: null` 与“未指定”语义相同，不会再因 `float(None)` 崩溃
@@ -1091,9 +1111,13 @@ python3 aimd_msd.py --specie Li --dt_fs 1.0
   - 未检测到 H → `POTIM = 2.0 fs`
 - 如果指定且含 H 且 > 1.5 fs → 发出警告
 - H 检测优先级：YAML `has_h` > POSCAR 元素 > POTCAR 扫描
-- 若上述信息都不可用：按 `has_h = true` 处理（`source=unknown_safe_default`），避免静默使用不安全的大时间步
+- POTCAR 扫描支持常见 H 变体（如 `H_h/H_s/H.5`）
+- 若 POTCAR 扫描不确定（无法解析到可靠元素符号）或上述信息都不可用：
+  - 按 `has_h = true` 处理，避免静默使用不安全的大时间步
+  - 头部会写明 `source=potcar_inconclusive_safe_default` 或 `source=unknown_safe_default`
 - 生成的 INCAR 头部会记录：
   - `# has_h=<bool> source=<source>`
+  - `# NOTE: H 检测不确定，按 has_h=true 保守处理...`（仅安全默认路径出现）
   - `# dt_fs resolved_by=user|auto_has_h|auto_no_h`
 
 ### ISTART / ICHARG 智能默认（v3.0.2）
@@ -1122,11 +1146,13 @@ python3 aimd_msd.py --specie Li --dt_fs 1.0
 | MAXMIX | 40 | 电荷混合历史 |
 | MDALGO | 3/2 | Langevin/Nosé-Hoover |
 | LANGEVIN_GAMMA | `g1 g2 ...` | **向量**，每种原子类型一个值 |
+| SMASS | 默认 `-3`（仅 Nosé-Hoover） | 保持现有默认策略；可显式覆盖 |
 | ISTART | 0/1 | stage-aware |
 | ICHARG | 0/2 | stage-aware |
 | ALGO | VeryFast/Fast | stage-aware |
-| LREAL | False/Auto | natoms-aware |
-| LWAVE | two_stage 默认 .TRUE. | 便于 eq→prod 重启（可配置） |
+| LREAL | `natoms<=200 -> .FALSE.`，否则 `Auto` | 当前阈值策略保留 |
+| LWAVE | staged 生成默认 `.TRUE.` | 便于跨阶段重启（可配置） |
+| NBLOCK/KBLOCK | 默认不写；如存在则显式写入 | 会影响轨迹写出步频与时间轴解释 |
 | LCHARG | .FALSE. | 不写 CHGCAR |
 
 ### 命令行参数
@@ -1139,7 +1165,7 @@ python3 make_incar_aimd.py --help
 |------|--------|------|
 | `--recipe` | recipe.yaml | 配方文件路径 |
 | `--out` | INCAR.aimd | 输出 INCAR 路径（单阶段模式） |
-| `--two_stage` | - | 生成 INCAR.eq 和 INCAR.prod |
+| `--two_stage` | - | 未定义 `simulation.stages` 时生成默认 INCAR.eq/INCAR.prod；若已定义 stages 则仅作为兼容入口并以 stages 为准 |
 | `--poscar` | POSCAR | POSCAR 文件路径（用于 NTYP 和 H 检测） |
 | `--potcar` | POTCAR | POTCAR 文件路径（H 检测回退） |
 | `--exe` | - | 可执行文件名（仅记录到注释） |

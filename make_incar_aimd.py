@@ -41,6 +41,8 @@ v3.0.2 修复摘要（安全默认 / traceability）：
 """
 
 import argparse
+import math
+import re
 import sys
 import os
 from datetime import datetime
@@ -81,16 +83,17 @@ def _is_all_int_tokens(tokens: List[str]) -> bool:
         return False
 
 
-def _next_nonempty_line(lines: List[Tuple[int, str]], cursor: int, field_name: str) -> Tuple[str, int]:
-    """Consume the next non-empty parsed line."""
-    if cursor >= len(lines):
-        print(f"[ERROR] POSCAR: 缺少 {field_name}")
-        sys.exit(1)
-    lineno, content = lines[cursor]
-    if not content:
-        print(f"[ERROR] POSCAR: 第 {lineno} 行为空，缺少 {field_name}")
-        sys.exit(1)
-    return content, cursor + 1
+def _next_poscar_data_line(raw_lines: List[str], cursor: int, field_name: str) -> Tuple[str, int, int]:
+    """Consume next non-empty POSCAR data line (line 1 comment is handled separately)."""
+    while cursor < len(raw_lines):
+        lineno = cursor + 1
+        cleaned = _strip_inline_comment(raw_lines[cursor].rstrip('\n'), strip_leading=False)
+        cursor += 1
+        if cleaned:
+            return cleaned, cursor, lineno
+
+    print(f"[ERROR] POSCAR: 缺少 {field_name}")
+    sys.exit(1)
 
 
 def parse_poscar_header(poscar_path: str) -> Dict[str, Any]:
@@ -121,24 +124,23 @@ def parse_poscar_header(poscar_path: str) -> Dict[str, Any]:
     with open(poscar_path, 'r', encoding='utf-8') as f:
         raw_lines = f.readlines()
 
-    parsed_lines: List[Tuple[int, str]] = []
-    for lineno, raw in enumerate(raw_lines, start=1):
-        cleaned = _strip_inline_comment(raw.rstrip('\n'), strip_leading=False)
-        if cleaned:
-            parsed_lines.append((lineno, cleaned))
-
-    if len(parsed_lines) < 5:
-        print(f"[ERROR] POSCAR 格式错误: 有效非空行不足 ({len(parsed_lines)} < 5)")
+    if not raw_lines:
+        print("[ERROR] POSCAR 为空")
         sys.exit(1)
 
-    cursor = 0
-    _, cursor = _next_nonempty_line(parsed_lines, cursor, "注释行")
-    _, cursor = _next_nonempty_line(parsed_lines, cursor, "缩放因子")
-    _, cursor = _next_nonempty_line(parsed_lines, cursor, "晶格向量 a")
-    _, cursor = _next_nonempty_line(parsed_lines, cursor, "晶格向量 b")
-    _, cursor = _next_nonempty_line(parsed_lines, cursor, "晶格向量 c")
+    if len(raw_lines) < 5:
+        print(f"[ERROR] POSCAR 格式错误: 总行数不足 ({len(raw_lines)} < 5)")
+        sys.exit(1)
 
-    line_a, cursor = _next_nonempty_line(parsed_lines, cursor, "元素符号或原子数行")
+    # POSCAR line 1 is the comment line by structure and may be blank.
+    cursor = 1
+
+    _, cursor, _ = _next_poscar_data_line(raw_lines, cursor, "缩放因子")
+    _, cursor, _ = _next_poscar_data_line(raw_lines, cursor, "晶格向量 a")
+    _, cursor, _ = _next_poscar_data_line(raw_lines, cursor, "晶格向量 b")
+    _, cursor, _ = _next_poscar_data_line(raw_lines, cursor, "晶格向量 c")
+
+    line_a, cursor, _ = _next_poscar_data_line(raw_lines, cursor, "元素符号或原子数行")
     tokens_a = line_a.split()
 
     if _is_all_int_tokens(tokens_a):
@@ -146,7 +148,7 @@ def parse_poscar_header(poscar_path: str) -> Dict[str, Any]:
         counts = [int(x) for x in tokens_a]
     else:
         elements = tokens_a
-        line_b, cursor = _next_nonempty_line(parsed_lines, cursor, "原子数行")
+        line_b, cursor, _ = _next_poscar_data_line(raw_lines, cursor, "原子数行")
         tokens_b = line_b.split()
         if not _is_all_int_tokens(tokens_b):
             print("[ERROR] POSCAR: 元素行后面的原子数行必须为整数列表")
@@ -180,6 +182,36 @@ def parse_poscar_header(poscar_path: str) -> Dict[str, Any]:
     }
 
 
+def _normalize_element_symbol(token: Any) -> Optional[str]:
+    """Return canonical element symbol parsed from token, e.g. H_h -> H."""
+    if token is None:
+        return None
+    text = str(token).strip()
+    if not text:
+        return None
+    match = re.match(r'^([A-Z][a-z]?)', text)
+    if not match:
+        return None
+    return match.group(1)
+
+
+def _extract_potcar_symbol_from_titel(line: str) -> Optional[str]:
+    """Extract probable element symbol from POTCAR TITEL line."""
+    payload = line.split('=', 1)[1] if '=' in line else line
+    tokens = payload.replace('/', ' ').split()
+    skip_tokens = {
+        'PAW', 'PAW_PBE', 'PAW_LDA', 'PAW_GGA',
+        'US', 'USPP', 'PBE', 'LDA', 'GGA', 'POTCAR'
+    }
+    for tok in tokens:
+        if tok.upper() in skip_tokens:
+            continue
+        symbol = _normalize_element_symbol(tok)
+        if symbol is not None:
+            return symbol
+    return None
+
+
 def detect_hydrogen(
     poscar_info: Dict[str, Any],
     potcar_path: str = "POTCAR",
@@ -191,39 +223,56 @@ def detect_hydrogen(
     Priority:
     1. YAML override (simulation.has_h)
     2. POSCAR element symbols
-    3. POTCAR VRHFIN scan
+    3. POTCAR VRHFIN/TITEL scan
     4. Unknown (safe default: assume H present)
     
     Returns:
         (has_h: bool, source: str)
-        source is one of: 'yaml_override', 'poscar_elements', 'potcar', 'unknown_safe_default'
+        source is one of:
+          'yaml_override', 'poscar_elements', 'potcar',
+          'potcar_inconclusive_safe_default', 'unknown_safe_default'
     """
     # 1. YAML override
     if yaml_override is not None:
-        return (yaml_override, 'yaml_override')
+        yaml_has_h = _coerce_bool(yaml_override, 'has_h', 'simulation')
+        return (yaml_has_h, 'yaml_override')
     
     elements = poscar_info.get('elements')
     
     # 2. POSCAR elements
     if elements is not None:
-        has_h = 'H' in elements
+        normalized_symbols = [_normalize_element_symbol(elem) for elem in elements]
+        has_h = any(sym == 'H' for sym in normalized_symbols if sym is not None)
         return (has_h, 'poscar_elements')
     
     # 3. POTCAR fallback
     if os.path.isfile(potcar_path):
         try:
+            parsed_any_symbol = False
             with open(potcar_path, 'r', encoding='utf-8', errors='ignore') as f:
                 for line in f:
-                    # POTCAR format: "   VRHFIN =H: ..."
-                    if 'VRHFIN' in line and '=' in line:
-                        # Extract element after =
-                        parts = line.split('=', 1)
-                        if len(parts) > 1:
-                            elem_part = parts[1].split(':')[0].strip()
-                            if elem_part == 'H':
-                                return (True, 'potcar')
-            # Scanned POTCAR, no H found
-            return (False, 'potcar')
+                    symbol = None
+                    # POTCAR format examples: "VRHFIN =H:", "VRHFIN = H_h:"
+                    vrhfin_match = re.search(r'^\s*VRHFIN\s*=\s*([^:]+)', line)
+                    if vrhfin_match:
+                        elem_part = vrhfin_match.group(1).strip()
+                        symbol = _normalize_element_symbol(elem_part)
+                    elif re.search(r'^\s*TITEL\s*=', line):
+                        symbol = _extract_potcar_symbol_from_titel(line)
+
+                    if symbol is None:
+                        continue
+
+                    parsed_any_symbol = True
+                    if symbol == 'H':
+                        return (True, 'potcar')
+
+            if parsed_any_symbol:
+                return (False, 'potcar')
+
+            print(f"[WARN] POTCAR 扫描未解析到有效元素符号: {potcar_path}")
+            print("       为避免不安全的大 POTIM，按含 H 体系处理（安全默认）")
+            return (True, 'potcar_inconclusive_safe_default')
         except Exception as e:
             print(f"[WARN] 读取 POTCAR 时出错: {e}")
     
@@ -242,7 +291,8 @@ def build_gamma_vector(
     sim: Dict,
     ntyp: int,
     elements: Optional[List[str]],
-    stage_name: Optional[str] = None
+    stage_name: Optional[str] = None,
+    stage_profile: Optional[str] = None
 ) -> List[float]:
     """
     Build LANGEVIN_GAMMA vector of length NTYP.
@@ -282,11 +332,7 @@ def build_gamma_vector(
             print(f"[ERROR] {gamma_list_key} 长度 ({len(gamma_list)}) != NTYP ({ntyp})")
             print(f"        POSCAR 原子类型数: {ntyp}")
             sys.exit(1)
-        try:
-            gamma_vec = [float(g) for g in gamma_list]
-        except (TypeError, ValueError):
-            print(f"[ERROR] {gamma_list_key} 包含无法转换为浮点数的值: {gamma_list}")
-            sys.exit(1)
+        gamma_vec = [_coerce_float(g, gamma_list_key, 'simulation') for g in gamma_list]
         return gamma_vec
 
     # 2. Try by-element dict
@@ -308,26 +354,19 @@ def build_gamma_vector(
                 print(f"        POSCAR 元素: {elements}")
                 print(f"        提供的元素: {list(gamma_by_elem.keys())}")
                 sys.exit(1)
-            try:
-                gamma_vec.append(float(gamma_by_elem[elem]))
-            except (TypeError, ValueError):
-                print(f"[ERROR] {gamma_by_elem_key} 中元素 '{elem}' 的值无法转为浮点数")
-                sys.exit(1)
+            gamma_vec.append(_coerce_float(gamma_by_elem[elem], gamma_by_elem_key, 'simulation'))
         return gamma_vec
 
     # 3. Try scalar (replicate for all NTYP)
     gamma_scalar_keys = _stage_keys('scalar') + ['gamma_1ps']
     gamma_scalar, gamma_scalar_key = _find_first(gamma_scalar_keys)
     if gamma_scalar is not None:
-        try:
-            gamma_value = float(gamma_scalar)
-        except (TypeError, ValueError):
-            print(f"[ERROR] {gamma_scalar_key} 无法转换为浮点数: {gamma_scalar}")
-            sys.exit(1)
+        gamma_value = _coerce_float(gamma_scalar, gamma_scalar_key, 'simulation')
         return [gamma_value] * ntyp
 
     # 4. Default
-    default_gamma = 10.0 if stage_name == 'eq' else 5.0
+    effective_profile = stage_profile if stage_profile in {'eq', 'prod'} else stage_name
+    default_gamma = 10.0 if effective_profile == 'eq' else 5.0
     print(f"[INFO] 未指定 gamma，使用默认值 {default_gamma} (所有原子类型)")
     return [default_gamma] * ntyp
 
@@ -377,6 +416,7 @@ def check_gamma_warning(
 def get_istart_icharg(
     sim: Dict,
     stage_name: Optional[str],
+    stage_profile: Optional[str] = None,
     check_wavecar: bool = True,
     two_stage_generating: bool = False
 ) -> Tuple[int, int, Optional[str], str]:
@@ -388,12 +428,13 @@ def get_istart_icharg(
     """
     warning = None
     resolved_by = 'default_cold_start'
+    effective_profile = stage_profile if stage_profile in {'eq', 'prod'} else stage_name
 
     def _find_override(key: str) -> Tuple[Optional[Any], Optional[str]]:
         keys: List[str] = []
-        if stage_name == 'eq':
+        if effective_profile == 'eq':
             keys.append(f'{key}_eq')
-        elif stage_name == 'prod':
+        elif effective_profile == 'prod':
             keys.append(f'{key}_prod')
         keys.append(key)
 
@@ -406,12 +447,12 @@ def get_istart_icharg(
     icharg_override, icharg_key = _find_override('icharg')
     has_user_override = istart_key is not None or icharg_key is not None
     
-    if stage_name == 'eq':
+    if effective_profile == 'eq':
         istart = istart_override if istart_override is not None else 0
         icharg = icharg_override if icharg_override is not None else 2
         if has_user_override:
             resolved_by = 'user_override'
-    elif stage_name == 'prod':
+    elif effective_profile == 'prod':
         istart = istart_override
         icharg = icharg_override
 
@@ -470,9 +511,9 @@ def resolve_stage_param(
     """Resolve parameter with precedence: stage-specific > global > INCAR.base > default."""
     if stage_name:
         stage_key = f"{key}_{stage_name}"
-        if stage_key in sim:
+        if stage_key in sim and sim[stage_key] is not None:
             return sim[stage_key]
-    if key in sim:
+    if key in sim and sim[key] is not None:
         return sim[key]
     base_key = key.upper()
     if base_key in base_params:
@@ -538,8 +579,10 @@ def normalize_thermostat(value: Any) -> str:
 def resolve_dt_fs(sim: Dict[str, Any], has_h: bool) -> Tuple[float, str]:
     """Resolve final POTIM in fs with traceable source."""
     dt_fs_val = sim.get('dt_fs', None)
+    if _is_unset_placeholder(dt_fs_val):
+        dt_fs_val = None
     if dt_fs_val is not None:
-        dt_fs = float(dt_fs_val)
+        dt_fs = _coerce_float(dt_fs_val, 'dt_fs', 'simulation')
         if dt_fs <= 0:
             print(f"[ERROR] simulation.dt_fs 必须 > 0，得到: {dt_fs}")
             sys.exit(1)
@@ -554,6 +597,7 @@ def get_algo_lreal(
     sim: Dict,
     base_params: Dict[str, Any],
     stage_name: Optional[str],
+    stage_profile: Optional[str],
     natoms: int
 ) -> Tuple[str, str]:
     """
@@ -563,7 +607,8 @@ def get_algo_lreal(
     - prod stage: ALGO=Fast (safer for production dynamics)
     - LREAL: natoms <= 200 → False, else Auto
     """
-    default_algo = 'Fast' if stage_name == 'prod' else 'VeryFast'
+    effective_profile = stage_profile if stage_profile in {'eq', 'prod'} else stage_name
+    default_algo = 'Fast' if effective_profile == 'prod' else 'VeryFast'
     default_lreal = '.FALSE.' if natoms <= 200 else 'Auto'
 
     algo = str(resolve_stage_param(sim, base_params, 'algo', stage_name, default_algo)).strip()
@@ -577,13 +622,15 @@ def get_lwave_lcharg(
     sim: Dict[str, Any],
     base_params: Dict[str, Any],
     stage_name: Optional[str],
+    stage_profile: Optional[str],
     two_stage_generating: bool
 ) -> Tuple[str, str]:
     """
     Resolve LWAVE/LCHARG with precedence:
     stage-specific > global > INCAR.base > defaults.
     """
-    if two_stage_generating and stage_name in {'eq', 'prod'}:
+    effective_profile = stage_profile if stage_profile in {'eq', 'prod'} else stage_name
+    if two_stage_generating and effective_profile in {'eq', 'prod'}:
         default_lwave = '.TRUE.'
     else:
         default_lwave = '.FALSE.'
@@ -602,6 +649,7 @@ def resolve_stage_settings(
     base_params: Dict[str, Any],
     poscar_info: Dict[str, Any],
     stage_name: Optional[str],
+    stage_profile: Optional[str],
     has_h: bool,
     h_source: str,
     check_wavecar: bool = True,
@@ -619,7 +667,7 @@ def resolve_stage_settings(
             return str(int(value)) if value.is_integer() else str(value)
         return str(value)
 
-    temp_c = sim.get('temperature_C', 25)
+    temp_c = _coerce_float(sim.get('temperature_C', 25), 'temperature_C', 'simulation')
     temp_k = round(temp_c + 273.15, 1)
     dt_fs, dt_fs_resolved_by = resolve_dt_fs(sim, has_h)
 
@@ -628,7 +676,7 @@ def resolve_stage_settings(
 
     gamma_vec: List[float] = []
     if thermostat == 'langevin':
-        gamma_vec = build_gamma_vector(sim, ntyp, elements, stage_name)
+        gamma_vec = build_gamma_vector(sim, ntyp, elements, stage_name, stage_profile=stage_profile)
         if len(gamma_vec) != ntyp:
             print(f"[ERROR] LANGEVIN_GAMMA 长度 ({len(gamma_vec)}) != NTYP ({ntyp})")
             sys.exit(1)
@@ -641,17 +689,28 @@ def resolve_stage_settings(
     encut = None if encut_raw is None else _coerce_float(encut_raw, 'encut', 'simulation')
     isym = 0
     maxmix = _coerce_int(resolve_stage_param(sim, base_params, 'maxmix', stage_name, 40), 'maxmix', 'simulation')
-    nsteps = int(sim.get('nsteps', 10000))
+    nsteps = _coerce_int(sim.get('nsteps', 10000), 'nsteps', 'simulation')
+    nblock_raw = resolve_stage_param(sim, base_params, 'nblock', stage_name, None)
+    kblock_raw = resolve_stage_param(sim, base_params, 'kblock', stage_name, None)
+    nblock = None if nblock_raw is None else _coerce_int(nblock_raw, 'nblock', 'simulation')
+    kblock = None if kblock_raw is None else _coerce_int(kblock_raw, 'kblock', 'simulation')
+    if nblock is not None and nblock < 1:
+        print(f"[ERROR] simulation.nblock 必须 >= 1，得到: {nblock}")
+        sys.exit(1)
+    if kblock is not None and kblock < 1:
+        print(f"[ERROR] simulation.kblock 必须 >= 1，得到: {kblock}")
+        sys.exit(1)
 
     istart, icharg, istart_warn, istart_icharg_resolved_by = get_istart_icharg(
         sim,
         stage_name,
+        stage_profile=stage_profile,
         check_wavecar=check_wavecar,
         two_stage_generating=two_stage_generating
     )
 
-    algo, lreal = get_algo_lreal(sim, base_params, stage_name, natoms)
-    lwave, lcharg = get_lwave_lcharg(sim, base_params, stage_name, two_stage_generating)
+    algo, lreal = get_algo_lreal(sim, base_params, stage_name, stage_profile, natoms)
+    lwave, lcharg = get_lwave_lcharg(sim, base_params, stage_name, stage_profile, two_stage_generating)
     lasph = normalize_vasp_bool(resolve_stage_param(sim, base_params, 'lasph', stage_name, '.TRUE.'), 'LASPH')
     addgrid = normalize_vasp_bool(resolve_stage_param(sim, base_params, 'addgrid', stage_name, '.TRUE.'), 'ADDGRID')
     mdalgo = 3 if thermostat == 'langevin' else 2
@@ -678,6 +737,10 @@ def resolve_stage_settings(
     }
     if encut is not None:
         resolved_params['ENCUT'] = _fmt_number(encut)
+    if nblock is not None:
+        resolved_params['NBLOCK'] = str(nblock)
+    if kblock is not None:
+        resolved_params['KBLOCK'] = str(kblock)
     if thermostat == 'langevin':
         resolved_params['LANGEVIN_GAMMA'] = ' '.join(f"{g:.2f}" for g in gamma_vec)
     else:
@@ -699,6 +762,8 @@ def resolve_stage_settings(
         'encut': encut,
         'isym': isym,
         'maxmix': maxmix,
+        'nblock': nblock,
+        'kblock': kblock,
         'istart': istart,
         'icharg': icharg,
         'istart_warn': istart_warn,
@@ -715,6 +780,7 @@ def resolve_stage_settings(
         'elements': elements,
         'has_h': has_h,
         'h_source': h_source,
+        'stage_profile': stage_profile,
         'resolved_params': resolved_params,
     }
 
@@ -725,8 +791,15 @@ def emit_resolution_messages(resolved: Dict[str, Any], stage_name: Optional[str]
 
     if resolved['has_h'] and resolved['dt_fs_resolved_by'] == 'auto_has_h':
         print(f"[INFO] {stage_prefix}dt_fs 未指定，使用默认 POTIM=1.0 fs (含 H)")
+        if 'safe_default' in resolved['h_source']:
+            print(f"[WARN] {stage_prefix}H 检测来源={resolved['h_source']}，采用保守默认 has_h=true")
     if resolved['has_h'] and resolved['dt_fs_resolved_by'] == 'user' and resolved['dt_fs'] > 1.5:
         print(f"[WARN] {stage_prefix}体系含 H 原子，POTIM={resolved['dt_fs']} fs 可能过大，建议 0.5-1.0 fs")
+    if resolved['nblock'] is not None or resolved['kblock'] is not None:
+        print(
+            f"[WARN] {stage_prefix}NBLOCK/KBLOCK={resolved['nblock']}/{resolved['kblock']} "
+            "会影响轨迹写出步频与时间轴解释，请与后处理保持一致"
+        )
 
     if resolved['istart_warn']:
         print(resolved['istart_warn'])
@@ -763,6 +836,8 @@ def print_stage_summary(resolved: Dict[str, Any], stage_name: Optional[str]) -> 
     print(f"ALGO/LREAL: {resolved['algo']}/{resolved['lreal']}")
     print(f"ISYM: {resolved['isym']} (强制关闭)")
     print(f"MAXMIX: {resolved['maxmix']}")
+    if resolved['nblock'] is not None or resolved['kblock'] is not None:
+        print(f"NBLOCK/KBLOCK: {resolved['nblock']}/{resolved['kblock']}")
     print("=" * 70)
 
 
@@ -813,26 +888,74 @@ def parse_incar_base(filepath: str) -> Dict[str, str]:
     return params
 
 
+NULL_LIKE_STRINGS = {'', 'null', 'none', '~'}
+
+
+def _is_unset_placeholder(value: Any) -> bool:
+    return isinstance(value, str) and value.strip().lower() in NULL_LIKE_STRINGS
+
+
+def _coerce_bool(value: Any, key: str, context: str) -> bool:
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if isinstance(value, float) and not math.isfinite(value):
+            print(f"[ERROR] {context}.{key} 需要布尔值，禁止非有限数值: {value}")
+            sys.exit(1)
+        if value == 1:
+            return True
+        if value == 0:
+            return False
+        print(f"[ERROR] {context}.{key} 需要布尔值（0/1 或 true/false），得到: {value}")
+        sys.exit(1)
+
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {'.true.', 'true', 't', 'yes', 'y', '1'}:
+            return True
+        if text in {'.false.', 'false', 'f', 'no', 'n', '0'}:
+            return False
+        print(f"[ERROR] {context}.{key} 需要布尔值（true/false），得到字符串: '{value}'")
+        sys.exit(1)
+
+    print(f"[ERROR] {context}.{key} 需要布尔值，得到不支持的类型: {type(value)}")
+    sys.exit(1)
+
+
 def _coerce_float(value: Any, key: str, context: str) -> float:
     if isinstance(value, bool):
         print(f"[ERROR] {context}.{key} 需要浮点数，不能是布尔值: {value}")
         sys.exit(1)
+    if _is_unset_placeholder(value):
+        print(f"[ERROR] {context}.{key} 不能使用占位符 '{value}'；请省略该键或使用 YAML null")
+        sys.exit(1)
     try:
-        return float(value)
-    except (TypeError, ValueError):
+        out = float(value)
+    except (TypeError, ValueError, OverflowError):
         print(f"[ERROR] {context}.{key} 需要浮点数，得到: {value}")
         sys.exit(1)
+    if not math.isfinite(out):
+        print(f"[ERROR] {context}.{key} 需要有限数值，禁止 NaN/Inf: {value}")
+        sys.exit(1)
+    return out
 
 
 def _coerce_int(value: Any, key: str, context: str) -> int:
     if isinstance(value, bool):
         print(f"[ERROR] {context}.{key} 需要整数，不能是布尔值: {value}")
         sys.exit(1)
+    if _is_unset_placeholder(value):
+        print(f"[ERROR] {context}.{key} 不能使用占位符 '{value}'；请省略该键或使用 YAML null")
+        sys.exit(1)
 
     if isinstance(value, int):
         return value
 
     if isinstance(value, float):
+        if not math.isfinite(value):
+            print(f"[ERROR] {context}.{key} 需要有限整数，禁止 NaN/Inf: {value}")
+            sys.exit(1)
         if value.is_integer():
             return int(value)
         print(f"[ERROR] {context}.{key} 需要整数，得到非整数浮点数: {value}")
@@ -847,6 +970,9 @@ def _coerce_int(value: Any, key: str, context: str) -> int:
                 as_float = float(text)
             except ValueError:
                 print(f"[ERROR] {context}.{key} 需要整数，得到: {value}")
+                sys.exit(1)
+            if not math.isfinite(as_float):
+                print(f"[ERROR] {context}.{key} 需要有限整数，禁止 NaN/Inf: {value}")
                 sys.exit(1)
             if as_float.is_integer():
                 return int(as_float)
@@ -877,21 +1003,33 @@ def validate_and_coerce_simulation(sim: Dict[str, Any], context: str = "simulati
         print(f"[ERROR] {context}.nsteps 必须 >= 1，得到: {out['nsteps']}")
         sys.exit(1)
 
+    if 'has_h' in out:
+        if _is_unset_placeholder(out['has_h']):
+            out['has_h'] = None
+        elif out['has_h'] is not None:
+            out['has_h'] = _coerce_bool(out['has_h'], 'has_h', context)
+
     optional_float_keys = ['dt_fs', 'smass', 'ediff', 'encut']
     for key in optional_float_keys:
-        if key in out and out[key] is not None:
-            out[key] = _coerce_float(out[key], key, context)
+        if key in out:
+            if _is_unset_placeholder(out[key]):
+                out[key] = None
+            elif out[key] is not None:
+                out[key] = _coerce_float(out[key], key, context)
 
     optional_int_keys = [
-        'nelm', 'maxmix',
+        'nelm', 'maxmix', 'nblock', 'kblock',
         'istart', 'icharg',
         'istart_eq', 'icharg_eq',
         'istart_prod', 'icharg_prod',
-        'nsteps_eq'
+        'nsteps_eq', 'nsteps_prod'
     ]
     for key in optional_int_keys:
-        if key in out and out[key] is not None:
-            out[key] = _coerce_int(out[key], key, context)
+        if key in out:
+            if _is_unset_placeholder(out[key]):
+                out[key] = None
+            elif out[key] is not None:
+                out[key] = _coerce_int(out[key], key, context)
 
     if 'dt_fs' in out and out['dt_fs'] is not None and out['dt_fs'] <= 0:
         print(f"[ERROR] {context}.dt_fs 必须 > 0，得到: {out['dt_fs']}")
@@ -899,6 +1037,9 @@ def validate_and_coerce_simulation(sim: Dict[str, Any], context: str = "simulati
 
     if 'nsteps_eq' in out and out['nsteps_eq'] is not None and out['nsteps_eq'] < 1:
         print(f"[ERROR] {context}.nsteps_eq 必须 >= 1，得到: {out['nsteps_eq']}")
+        sys.exit(1)
+    if 'nsteps_prod' in out and out['nsteps_prod'] is not None and out['nsteps_prod'] < 1:
+        print(f"[ERROR] {context}.nsteps_prod 必须 >= 1，得到: {out['nsteps_prod']}")
         sys.exit(1)
 
     return out
@@ -921,6 +1062,7 @@ def generate_incar_content(
     base_params: Dict,
     poscar_info: Dict[str, Any],
     stage_name: Optional[str] = None,
+    stage_profile: Optional[str] = None,
     exe: str = None,
     has_h: bool = False,
     h_source: str = 'unknown',
@@ -931,7 +1073,7 @@ def generate_incar_content(
     """生成 INCAR 内容"""
     if resolved is None:
         resolved = resolve_stage_settings(
-            sim, base_params, poscar_info, stage_name, has_h, h_source,
+            sim, base_params, poscar_info, stage_name, stage_profile, has_h, h_source,
             check_wavecar=check_wavecar,
             two_stage_generating=two_stage_generating
         )
@@ -967,9 +1109,13 @@ def generate_incar_content(
     lines.append(f"# 生成时间: {timestamp}")
     if stage_name:
         lines.append(f"# 阶段: {stage_name.upper()}")
+    if resolved.get('stage_profile'):
+        lines.append(f"# stage_profile={resolved['stage_profile']} (用于 stage-aware 默认值)")
     if stage_name == 'prod' and two_stage_generating:
         lines.append("# NOTE: expects WAVECAR from eq stage; if missing, set ISTART=0/ICHARG=2.")
     lines.append(f"# has_h={resolved['has_h']} source={h_source}")
+    if 'safe_default' in h_source:
+        lines.append("# NOTE: H 检测不确定，按 has_h=true 保守处理，避免过大的 POTIM")
     lines.append(f"# dt_fs resolved_by={resolved['dt_fs_resolved_by']}")
     lines.append(f"# ISTART/ICHARG resolved_by={resolved['istart_icharg_resolved_by']}")
     lines.append(f"# 温度: {temp_c} °C = {temp_k} K")
@@ -991,6 +1137,8 @@ def generate_incar_content(
     lines.append(f"# ALGO: {algo}, LREAL: {lreal}")
     lines.append(f"# LWAVE: {lwave}, LCHARG: {lcharg}")
     lines.append(f"# ISTART: {istart}, ICHARG: {icharg}")
+    if resolved['nblock'] is not None or resolved['kblock'] is not None:
+        lines.append(f"# NBLOCK/KBLOCK: {resolved['nblock']}/{resolved['kblock']} (影响轨迹写出步频)")
     if exe:
         lines.append(f"# 可执行文件: {exe}")
     lines.append("# " + "=" * 70)
@@ -1000,7 +1148,8 @@ def generate_incar_content(
         'IBRION', 'NSW', 'POTIM', 'TEBEG', 'TEEND', 'SMASS',
         'MDALGO', 'LANGEVIN_GAMMA', 'LWAVE', 'LCHARG',
         'NELM', 'EDIFF', 'ISTART', 'ICHARG', 'ISYM', 'MAXMIX',
-        'ALGO', 'LREAL', 'ENCUT', 'LASPH', 'ADDGRID'
+        'ALGO', 'LREAL', 'ENCUT', 'LASPH', 'ADDGRID',
+        'NBLOCK', 'KBLOCK'
     }
 
     # 继承参数（剔除受脚本托管的键）
@@ -1047,6 +1196,10 @@ def generate_incar_content(
     lines.append(f"IBRION = {resolved_params['IBRION']}   # MD 模式")
     lines.append(f"NSW = {resolved_params['NSW']}")
     lines.append(f"POTIM = {resolved_params['POTIM']}   # 时间步长 (fs)")
+    if 'NBLOCK' in resolved_params:
+        lines.append(f"NBLOCK = {resolved_params['NBLOCK']}   # 轨迹写出步频控制（影响时间轴解释）")
+    if 'KBLOCK' in resolved_params:
+        lines.append(f"KBLOCK = {resolved_params['KBLOCK']}   # 轨迹写出步频控制（影响时间轴解释）")
     lines.append("")
 
     # 温度
@@ -1104,6 +1257,65 @@ def generate_incar_content(
 # =============================================================================
 # Main
 # =============================================================================
+
+def validate_stages_config(stages: Any) -> List[Dict[str, Any]]:
+    """Validate simulation.stages structure with explicit, fail-loud diagnostics."""
+    if not isinstance(stages, list):
+        print(f"[ERROR] simulation.stages 必须是列表，得到: {type(stages)}")
+        sys.exit(1)
+    if not stages:
+        print("[ERROR] simulation.stages 已定义但为空。请删除该键或至少定义一个阶段。")
+        sys.exit(1)
+
+    validated: List[Dict[str, Any]] = []
+    seen_names = set()
+    for idx, stage in enumerate(stages):
+        if not isinstance(stage, dict):
+            print(f"[ERROR] simulation.stages[{idx}] 必须是字典，得到: {type(stage)}")
+            sys.exit(1)
+
+        raw_name = stage.get('name')
+        if not isinstance(raw_name, str) or not raw_name.strip():
+            print(f"[ERROR] simulation.stages[{idx}].name 必须是非空字符串")
+            sys.exit(1)
+        stage_name = raw_name.strip()
+        if stage_name in seen_names:
+            print(f"[ERROR] simulation.stages 出现重复阶段名: '{stage_name}'")
+            sys.exit(1)
+        seen_names.add(stage_name)
+
+        bad_stage_nsteps_aliases = [
+            key for key in ('nsteps_eq', 'nsteps_prod')
+            if key in stage and not _is_unset_placeholder(stage[key]) and stage[key] is not None
+        ]
+        if bad_stage_nsteps_aliases:
+            print(
+                f"[ERROR] simulation.stages[{stage_name}] 不支持 {bad_stage_nsteps_aliases}。"
+                "在 stages 模式中请使用 stage.nsteps"
+            )
+            sys.exit(1)
+
+        stage_copy = dict(stage)
+        stage_copy['name'] = stage_name
+        validated.append(stage_copy)
+
+    return validated
+
+
+def infer_stage_profile(stage_name: str, stage_index: int, total_stages: int) -> Optional[str]:
+    """
+    Infer default profile for stage-aware defaults.
+    - name eq/prod -> use directly
+    - custom names with 2+ stages -> first treated as eq, others as prod
+    - single custom stage -> no profile (single-stage defaults)
+    """
+    lowered = stage_name.lower()
+    if lowered in {'eq', 'prod'}:
+        return lowered
+    if total_stages <= 1:
+        return None
+    return 'eq' if stage_index == 0 else 'prod'
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -1193,109 +1405,136 @@ v3.0.2 新特性:
         print("\n>>> 未找到 INCAR.base，将生成完整模板")
 
     # 生成 INCAR
-    if args.two_stage:
-        # 两段式
-        stages = sim.get('stages', None)
-        
-        if stages:
-            # 使用 recipe 中定义的阶段
-            for stage in stages:
-                stage_name = stage.get('name', 'unknown')
-                stage_sim = sim.copy()
-                stage_sim.update(stage)
-                stage_sim = validate_and_coerce_simulation(stage_sim, context=f"simulation.stages[{stage_name}]")
-                resolved = resolve_stage_settings(
-                    stage_sim, base_params, poscar_info,
-                    stage_name, has_h, h_source,
-                    check_wavecar=False,
-                    two_stage_generating=True
-                )
-                emit_resolution_messages(resolved, stage_name)
+    has_stages_key = 'stages' in sim
+    stages_raw = sim.get('stages', None)
+    use_yaml_stages = has_stages_key
+    if has_stages_key and stages_raw is None:
+        print("[ERROR] simulation.stages 已定义为 null。请删除该键或提供非空 stages 列表。")
+        sys.exit(1)
 
-                content = generate_incar_content(
-                    stage_sim, base_params, poscar_info,
-                    stage_name, args.exe, has_h, h_source,
-                    check_wavecar=False,
-                    two_stage_generating=True,
-                    resolved=resolved
-                )
-                outfile = f"INCAR.{stage_name}"
-                with open(outfile, 'w', encoding='utf-8') as f:
-                    f.write(content)
-                print(f"\n>>> 已写入: {outfile}")
-                print_stage_summary(resolved, stage_name)
-            # DO NOT write args.out in two_stage mode with stages
+    if use_yaml_stages:
+        stages = validate_stages_config(stages_raw)
+        bad_global_nsteps_aliases = [
+            key for key in ('nsteps_eq', 'nsteps_prod')
+            if key in sim and sim[key] is not None
+        ]
+        if bad_global_nsteps_aliases:
+            print(
+                f"[ERROR] simulation.stages 模式下不使用 {bad_global_nsteps_aliases}。"
+                "请将步数写入各 stage.nsteps（或仅保留全局 nsteps 作为默认）"
+            )
+            sys.exit(1)
+
+        if args.two_stage:
+            print("[INFO] 检测到 simulation.stages：按 YAML 阶段定义生成，忽略 --two_stage 的默认 eq/prod 推导")
         else:
-            # 默认两段
-            # 平衡段
-            eq_sim = sim.copy()
-            inferred_nsteps_eq = sim.get('nsteps', 10000) // 5
-            if inferred_nsteps_eq < 1:
-                print(f"[WARN] nsteps//5 = {inferred_nsteps_eq} < 1，自动提升为 nsteps_eq=1")
-            eq_sim['nsteps'] = sim.get('nsteps_eq', max(1, inferred_nsteps_eq))
-            eq_sim = validate_and_coerce_simulation(eq_sim, context='simulation(eq)')
-            eq_resolved = resolve_stage_settings(
-                eq_sim, base_params, poscar_info,
-                'eq', has_h, h_source,
-                check_wavecar=False,
-                two_stage_generating=True
-            )
-            emit_resolution_messages(eq_resolved, 'eq')
+            print("[INFO] 检测到 simulation.stages：按 YAML 阶段定义生成多阶段 INCAR，忽略 --out 单文件模式")
 
-            eq_content = generate_incar_content(
-                eq_sim, base_params, poscar_info,
-                'eq', args.exe, has_h, h_source,
-                check_wavecar=False,
-                two_stage_generating=True,
-                resolved=eq_resolved
-            )
-            with open('INCAR.eq', 'w', encoding='utf-8') as f:
-                f.write(eq_content)
-            print("\n>>> 已写入: INCAR.eq (平衡段)")
-            print_stage_summary(eq_resolved, 'eq')
+        total_stages = len(stages)
+        for idx, stage in enumerate(stages):
+            stage_name = stage['name']
+            stage_profile = infer_stage_profile(stage_name, idx, total_stages)
+            if stage_name.lower() not in {'eq', 'prod'} and stage_profile in {'eq', 'prod'}:
+                print(
+                    f"[INFO] 阶段 '{stage_name}' 采用 stage_profile={stage_profile} "
+                    "(用于默认 gamma/ALGO/ISTART/ICHARG/LWAVE 规则)"
+                )
 
-            # 生产段
-            prod_sim = sim.copy()
-            prod_sim = validate_and_coerce_simulation(prod_sim, context='simulation(prod)')
-            prod_resolved = resolve_stage_settings(
-                prod_sim, base_params, poscar_info,
-                'prod', has_h, h_source,
+            stage_sim = sim.copy()
+            stage_sim.update(stage)
+            stage_sim = validate_and_coerce_simulation(stage_sim, context=f"simulation.stages[{stage_name}]")
+            resolved = resolve_stage_settings(
+                stage_sim, base_params, poscar_info,
+                stage_name, stage_profile, has_h, h_source,
                 check_wavecar=False,
-                two_stage_generating=True
+                two_stage_generating=(total_stages > 1)
             )
-            emit_resolution_messages(prod_resolved, 'prod')
+            emit_resolution_messages(resolved, stage_name)
 
-            prod_content = generate_incar_content(
-                prod_sim, base_params, poscar_info,
-                'prod', args.exe, has_h, h_source,
+            content = generate_incar_content(
+                stage_sim, base_params, poscar_info,
+                stage_name, stage_profile, args.exe, has_h, h_source,
                 check_wavecar=False,
-                two_stage_generating=True,
-                resolved=prod_resolved
+                two_stage_generating=(total_stages > 1),
+                resolved=resolved
             )
-            with open('INCAR.prod', 'w', encoding='utf-8') as f:
-                f.write(prod_content)
-            print(">>> 已写入: INCAR.prod (生产段)")
-            print_stage_summary(prod_resolved, 'prod')
+            outfile = f"INCAR.{stage_name}"
+            with open(outfile, 'w', encoding='utf-8') as f:
+                f.write(content)
+            print(f"\n>>> 已写入: {outfile}")
+            print_stage_summary(resolved, stage_name)
+        # DO NOT write args.out in staged mode
+    elif args.two_stage:
+        # 默认两段
+        # 平衡段
+        eq_sim = sim.copy()
+        inferred_nsteps_eq = sim.get('nsteps', 10000) // 5
+        if inferred_nsteps_eq < 1:
+            print(f"[WARN] nsteps//5 = {inferred_nsteps_eq} < 1，自动提升为 nsteps_eq=1")
+        eq_sim['nsteps'] = sim.get('nsteps_eq', max(1, inferred_nsteps_eq))
+        eq_sim = validate_and_coerce_simulation(eq_sim, context='simulation(eq)')
+        eq_resolved = resolve_stage_settings(
+            eq_sim, base_params, poscar_info,
+            'eq', 'eq', has_h, h_source,
+            check_wavecar=False,
+            two_stage_generating=True
+        )
+        emit_resolution_messages(eq_resolved, 'eq')
 
-            print("\n两段式用法:")
-            print("  1. cp INCAR.eq INCAR && run_vasp.sh")
-            print("  2. cp CONTCAR POSCAR")
-            print("  3. 保留/复制平衡段产生的 WAVECAR 到生产段目录")
-            print("     (若需 ICHARG=1，还需保留 CHGCAR)")
-            print("  4. cp INCAR.prod INCAR && run_vasp.sh")
-            print("  5. 若无 WAVECAR，请将 INCAR.prod 改为 ISTART=0, ICHARG=2")
-            print("  6. 扩散分析只用生产段轨迹")
-            # DO NOT write args.out in two_stage mode
+        eq_content = generate_incar_content(
+            eq_sim, base_params, poscar_info,
+            'eq', 'eq', args.exe, has_h, h_source,
+            check_wavecar=False,
+            two_stage_generating=True,
+            resolved=eq_resolved
+        )
+        with open('INCAR.eq', 'w', encoding='utf-8') as f:
+            f.write(eq_content)
+        print("\n>>> 已写入: INCAR.eq (平衡段)")
+        print_stage_summary(eq_resolved, 'eq')
+
+        # 生产段
+        prod_sim = sim.copy()
+        prod_sim = validate_and_coerce_simulation(prod_sim, context='simulation(prod)')
+        prod_resolved = resolve_stage_settings(
+            prod_sim, base_params, poscar_info,
+            'prod', 'prod', has_h, h_source,
+            check_wavecar=False,
+            two_stage_generating=True
+        )
+        emit_resolution_messages(prod_resolved, 'prod')
+
+        prod_content = generate_incar_content(
+            prod_sim, base_params, poscar_info,
+            'prod', 'prod', args.exe, has_h, h_source,
+            check_wavecar=False,
+            two_stage_generating=True,
+            resolved=prod_resolved
+        )
+        with open('INCAR.prod', 'w', encoding='utf-8') as f:
+            f.write(prod_content)
+        print(">>> 已写入: INCAR.prod (生产段)")
+        print_stage_summary(prod_resolved, 'prod')
+
+        print("\n两段式用法:")
+        print("  1. cp INCAR.eq INCAR && run_vasp.sh")
+        print("  2. cp CONTCAR POSCAR")
+        print("  3. 保留/复制平衡段产生的 WAVECAR 到生产段目录")
+        print("     (若需 ICHARG=1，还需保留 CHGCAR)")
+        print("  4. cp INCAR.prod INCAR && run_vasp.sh")
+        print("  5. 若无 WAVECAR，请将 INCAR.prod 改为 ISTART=0, ICHARG=2")
+        print("  6. 扩散分析只用生产段轨迹")
+        # DO NOT write args.out in two_stage mode
     else:
         # 单一 INCAR
         resolved = resolve_stage_settings(
             sim, base_params, poscar_info,
-            None, has_h, h_source
+            None, None, has_h, h_source
         )
         emit_resolution_messages(resolved, None)
         content = generate_incar_content(
             sim, base_params, poscar_info,
-            None, args.exe, has_h, h_source,
+            None, None, args.exe, has_h, h_source,
             resolved=resolved
         )
         with open(args.out, 'w', encoding='utf-8') as f:
