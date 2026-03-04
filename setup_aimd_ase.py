@@ -73,6 +73,7 @@ import os
 import sys
 import shutil
 import json
+import re
 from collections import deque
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Set, Any
@@ -265,6 +266,7 @@ if not HAS_UTILS:
         
         # 计算距离矩阵
         use_mic = cell is not None and pbc is not None and np.any(pbc)
+        pbc_mask = np.array(pbc, dtype=bool) if pbc is not None else np.array([False, False, False])
         
         for i in range(n_atoms):
             for j in range(i + 1, n_atoms):
@@ -275,7 +277,8 @@ if not HAS_UTILS:
                     try:
                         cell_inv = np.linalg.inv(cell)
                         d_frac = np.dot(d_cart, cell_inv)
-                        d_frac -= np.round(d_frac)
+                        # 仅在周期方向应用 MIC，非周期方向保持原始分量
+                        d_frac[pbc_mask] -= np.round(d_frac[pbc_mask])
                         d_cart = np.dot(d_frac, cell)
                     except np.linalg.LinAlgError:
                         pass  # 使用原始 d_cart
@@ -443,18 +446,25 @@ def has_valid_cell_for_mic(atoms: Atoms) -> bool:
     
     v2.4: 用于距离/碰撞检测，cluster+vacuum 模式应返回 False
     """
-    if not atoms.pbc.any():
+    pbc = np.asarray(atoms.pbc, dtype=bool)
+    if not np.any(pbc):
         return False
     try:
-        # 检查 cell 是否有足够的体积或有效的分量
-        cell_lengths = atoms.cell.lengths()
-        # 至少有一个方向有有效的周期长度
-        valid_lengths = cell_lengths > 1e-6
-        # PBC 方向必须有有效的 cell 长度
-        for i in range(3):
-            if atoms.pbc[i] and not valid_lengths[i]:
+        cell = np.asarray(atoms.cell.array, dtype=float)
+        cell_lengths = np.linalg.norm(cell, axis=1)
+
+        # PBC 方向必须有有效的晶格矢量长度
+        if np.any(np.logical_and(pbc, cell_lengths <= 1e-6)):
+            return False
+
+        # 多个周期方向时要求对应晶格矢量线性无关
+        periodic_vecs = cell[pbc]
+        n_periodic = periodic_vecs.shape[0]
+        if n_periodic >= 2:
+            rank = np.linalg.matrix_rank(periodic_vecs, tol=1e-8)
+            if rank < n_periodic:
                 return False
-        return atoms.pbc.any() and atoms.cell.volume > 1e-8
+        return True
     except:
         return False
 
@@ -478,9 +488,13 @@ def _explain_invalid_mic(atoms: Atoms) -> str:
         if invalid_axes:
             axes_str = ", ".join(str(i) for i in invalid_axes)
             reasons.append(f"周期方向 {axes_str} 的 cell 长度无效 (<= 1e-6 Å)")
-        volume = float(atoms.cell.volume)
-        if volume <= 1e-8:
-            reasons.append(f"cell 体积无效 (<= 1e-8 Å^3, 当前 {volume:.3e})")
+        cell = np.asarray(atoms.cell.array, dtype=float)
+        pbc_mask = np.array(pbc, dtype=bool)
+        periodic_vecs = cell[pbc_mask]
+        if periodic_vecs.shape[0] >= 2:
+            rank = np.linalg.matrix_rank(periodic_vecs, tol=1e-8)
+            if rank < periodic_vecs.shape[0]:
+                reasons.append("周期方向的晶格矢量线性相关，无法可靠 MIC")
     except Exception as exc:
         reasons.append(f"无法解析 cell 信息: {exc}")
 
@@ -678,16 +692,84 @@ def parse_poscar_element_order(poscar_path: str) -> List[str]:
     if len(lines) < 7:
         raise ValueError(f"POSCAR 格式错误: {poscar_path}")
     
-    # 第 6 行是元素符号（0-indexed line 5）
-    element_line = lines[5].strip()
-    elements = element_line.split()
-    
-    # 验证：应该都是元素符号，不是数字
-    for elem in elements:
-        if elem.isdigit():
-            raise ValueError(f"POSCAR 第 6 行应为元素符号，但发现数字: {element_line}")
-    
-    return elements
+    line1 = lines[0].strip()
+    line6 = lines[5].strip()
+    line7 = lines[6].strip()
+    tokens6 = line6.split()
+    tokens7 = line7.split()
+
+    def _is_int_token(token: str) -> bool:
+        try:
+            int(token)
+            return True
+        except Exception:
+            return False
+
+    def _is_valid_elem_symbol(token: str) -> bool:
+        if not token:
+            return False
+        if _HAS_ASE_DATA:
+            return token in ASE_ATOMIC_NUMBERS
+        return token in _INTERNAL_ATOMIC_MASSES or token in COVALENT_RADII
+
+    if not tokens6:
+        raise ValueError(f"POSCAR 第 6 行为空: {poscar_path}")
+
+    # VASP5: line6 为元素符号，line7 为计数
+    if all(_is_valid_elem_symbol(tok) for tok in tokens6):
+        if not all(_is_int_token(tok) for tok in tokens7):
+            raise ValueError(
+                f"POSCAR 格式异常: 第 6 行看似元素符号，但第 7 行不是纯计数: '{line7}'"
+            )
+        return tokens6
+
+    # VASP4: line6 为计数（无元素行）
+    if all(_is_int_token(tok) for tok in tokens6):
+        ntypes = len(tokens6)
+
+        # 尝试从注释行提取元素顺序（常见 VASP4 习惯）
+        comment_candidates: List[str] = []
+        for tok in line1.split():
+            if _is_valid_elem_symbol(tok) and tok not in comment_candidates:
+                comment_candidates.append(tok)
+        if len(comment_candidates) >= ntypes:
+            picked = comment_candidates[:ntypes]
+            print(
+                f"[WARN] 检测到 VASP4 风格 POSCAR（无元素行），"
+                f"使用注释行推断元素顺序: {' '.join(picked)}"
+            )
+            return picked
+
+        # 最后回退: 读 POSCAR 原子并取首次出现顺序（确定性）
+        try:
+            atoms_poscar = read(poscar_path, format='vasp')
+            ordered: List[str] = []
+            for sym in atoms_poscar.get_chemical_symbols():
+                if sym not in ordered:
+                    ordered.append(sym)
+            if len(ordered) == ntypes:
+                print(
+                    f"[WARN] 检测到 VASP4 风格 POSCAR（无元素行），"
+                    f"使用原子序列推断元素顺序: {' '.join(ordered)}"
+                )
+                return ordered
+            if ordered:
+                print(
+                    f"[WARN] VASP4 元素顺序推断不完整（期望 {ntypes}，得到 {len(ordered)}），"
+                    "将按推断顺序继续。"
+                )
+                return ordered
+        except Exception as exc:
+            print(f"[WARN] VASP4 元素顺序回退解析失败: {exc}")
+
+        raise ValueError(
+            f"POSCAR 为 VASP4 风格且无法可靠推断元素顺序: {poscar_path}. "
+            "请提供 VASP5 格式 POSCAR（含元素行）。"
+        )
+
+    raise ValueError(
+        f"POSCAR 第 6 行格式无法识别（既非元素行也非计数行）: '{line6}'"
+    )
 
 
 # ==============================================================================
@@ -698,8 +780,10 @@ def parse_center_atom(center_str: str, atoms: Atoms, one_based: bool = False) ->
     """解析中心原子参数"""
     n_atoms = len(atoms)
     symbols = atoms.get_chemical_symbols()
-    
-    try:
+    center_str = center_str.strip()
+
+    # 先区分整数索引 / 非整数数值 / 元素符号
+    if re.fullmatch(r"[+-]?\d+", center_str):
         idx = int(center_str)
         if one_based:
             idx -= 1
@@ -707,18 +791,24 @@ def parse_center_atom(center_str: str, atoms: Atoms, one_based: bool = False) ->
             print(f"[WARN] 索引 {center_str} = 原子总数，按 1-based 解释为 {idx - 1}")
             idx -= 1
         if idx < 0 or idx >= n_atoms:
-            raise ValueError(f"原子索引 {idx} 超出范围 [0, {n_atoms - 1}]")
+            raise ValueError(f"原子索引越界: {idx}，有效范围 [0, {n_atoms - 1}]")
         return idx
+
+    # 数值但非整数：明确报错，不误判成元素名
+    try:
+        float(center_str)
     except ValueError:
         pass
-    
-    element = center_str.strip()
+    else:
+        raise ValueError(f"中心原子索引必须是整数，收到: '{center_str}'")
+
+    element = center_str
     for i, sym in enumerate(symbols):
         if sym == element:
             print(f"[INFO] 找到第一个 {element} 原子，索引 {i}")
             return i
     
-    raise ValueError(f"未找到元素 '{element}'，可用: {set(symbols)}")
+    raise ValueError(f"未找到元素符号 '{element}'，可用: {sorted(set(symbols))}")
 
 
 def select_indices_with_mic_vectors(
@@ -811,11 +901,19 @@ def reimage_atoms_around_center(
             if not remaining:
                 break
             seed = int(remaining[0])
-            placed[seed] = np.array(positions[seed], dtype=float)
+            if valid_cell:
+                # 对不连通分量使用“中心 MIC 位移”锚定，避免落到远端周期像
+                anchor = np.array(center_pos + mic_vectors[seed], dtype=float)
+                placed[seed] = anchor
+                warnings.append(
+                    f"[WARN] 选中集合含与中心不连通分量（seed={seed}），使用中心 MIC 锚定后局部拓扑展开"
+                )
+            else:
+                placed[seed] = np.array(positions[seed], dtype=float)
+                warnings.append(
+                    f"[WARN] 选中集合含与中心不连通分量（seed={seed}），无有效 MIC，按原坐标锚定"
+                )
             queue.append(seed)
-            warnings.append(
-                f"[WARN] 选中集合含与中心不连通分量（seed={seed}），按原坐标锚定后局部拓扑展开"
-            )
 
         new_positions = [placed[int(idx)] for idx in selected_indices]
         new_symbols = [symbols[int(idx)] for idx in selected_indices]
@@ -1084,9 +1182,10 @@ def create_density_based_bulk_box(
     cluster: Atoms,
     original_density: Optional[float],
     target_density: Optional[float],
-    use_mic: bool,
+    mic_mode: str,
     cell_shape: str = 'scale_parent',
     parent_cell: Optional[np.ndarray] = None,
+    parent_is_3d_density_valid: bool = True,
     min_cell_length: float = 10.0,
     span_padding: float = 4.0,
     density_warn_pct: float = 10.0,
@@ -1105,6 +1204,7 @@ def create_density_based_bulk_box(
         target_density: 目标密度 (g/cm³)，None 则使用 original_density
         cell_shape: 'scale_parent' 或 'cubic'
         parent_cell: 父体系晶胞（用于 scale_parent）
+        parent_is_3d_density_valid: 父体系是否为有效 3D 密度来源
         min_cell_length: 最小盒子边长 (Å)
     
     Returns:
@@ -1116,6 +1216,7 @@ def create_density_based_bulk_box(
     symbols = cluster.get_chemical_symbols()
     warnings: List[str] = []
     positions = cluster.get_positions()
+    target_density_was_explicit = target_density is not None
     
     # 确定目标密度
     if target_density is None:
@@ -1136,10 +1237,40 @@ def create_density_based_bulk_box(
         target_volume = min_volume
     
     # 生成新晶胞
-    if cell_shape == 'scale_parent' and parent_cell is not None:
+    use_scale_parent = (cell_shape == 'scale_parent')
+    if use_scale_parent and parent_cell is not None and parent_is_3d_density_valid:
         new_cell = scale_cell_to_volume(parent_cell, target_volume, 'scale_proportional')
     else:
+        if use_scale_parent:
+            if parent_cell is None:
+                msg = (
+                    "cell_shape=scale_parent 但缺少有效 parent_cell，回退到 cubic 盒子。"
+                )
+            else:
+                src = "显式 --density_g_cm3" if target_density_was_explicit else "默认密度"
+                msg = (
+                    "cell_shape=scale_parent 需要有效 3D 周期父体系；"
+                    f"当前输入不是 3D 密度来源（{src}），回退到 cubic 盒子。"
+                )
+            warnings.append(msg)
+            print(f"[WARN] {msg}")
         new_cell = scale_cell_to_volume(np.eye(3) * 10, target_volume, 'cubic')
+
+    def _enlarge_cell_preserve_shape(
+        cell_matrix: np.ndarray,
+        old_lengths: np.ndarray,
+        target_lengths: np.ndarray
+    ) -> np.ndarray:
+        """
+        放大 cell 至最小长度要求。
+        - scale_parent: 保持晶格方向/角度，仅缩放各晶格矢量长度
+        - cubic: 直接使用对角盒子
+        """
+        if use_scale_parent:
+            safe_old = np.where(old_lengths > 1e-12, old_lengths, 1.0)
+            scale_vec = target_lengths / safe_old
+            return np.array(cell_matrix, dtype=float) * scale_vec[:, None]
+        return np.diag(target_lengths)
 
     # 防止边界自交叠: 保证盒长覆盖真实空间跨度 + padding
     min_pos = positions.min(axis=0)
@@ -1152,7 +1283,8 @@ def create_density_based_bulk_box(
         cell_lengths = np.linalg.norm(np.array(new_cell, dtype=float), axis=1)
     enforced_lengths = np.maximum(cell_lengths, required_lengths)
     if np.any(enforced_lengths > cell_lengths + 1e-8):
-        new_cell = np.diag(enforced_lengths)
+        base_cell = np.asarray(new_cell.array if hasattr(new_cell, 'array') else new_cell, dtype=float)
+        new_cell = _enlarge_cell_preserve_shape(base_cell, cell_lengths, enforced_lengths)
         msg = (
             "Cell enlarged to prevent PBC self-intersection "
             f"(span={span.round(3)} Å, padding={span_padding:.2f} Å)."
@@ -1165,14 +1297,18 @@ def create_density_based_bulk_box(
     cluster.set_pbc([True, True, True])
     cluster.center()
 
+    # 盒子已更新，MIC 必须按当前 cell/pbc 重新决策
+    try:
+        box_use_mic = resolve_use_mic(cluster, mic_mode)
+    except ValueError as exc:
+        raise ValueError(f"bulk 盒子生成后 MIC 解析失败: {exc}") from exc
+
     # 若仍存在严重重叠，自动迭代放大晶胞
-    last_clash_info = detect_atomic_clashes(cluster, use_mic=use_mic, scale=clash_scale)
+    last_clash_info = detect_atomic_clashes(cluster, use_mic=box_use_mic, scale=clash_scale)
     for it in range(max_expand_iters):
         if not last_clash_info['has_clashes']:
             break
-        old_lengths = np.array(cluster.get_cell().lengths(), dtype=float)
-        new_lengths = old_lengths * expand_factor
-        cluster.set_cell(np.diag(new_lengths))
+        cluster.set_cell(np.asarray(cluster.get_cell().array, dtype=float) * float(expand_factor))
         cluster.center()
         msg = (
             f"Bulk cell auto-expanded ({it+1}/{max_expand_iters}) due to clashes: "
@@ -1180,7 +1316,7 @@ def create_density_based_bulk_box(
         )
         warnings.append(msg)
         print(f"[WARN] {msg}")
-        last_clash_info = detect_atomic_clashes(cluster, use_mic=use_mic, scale=clash_scale)
+        last_clash_info = detect_atomic_clashes(cluster, use_mic=box_use_mic, scale=clash_scale)
 
     if last_clash_info['has_clashes']:
         raise ValueError(
@@ -1340,7 +1476,9 @@ def estimate_charge_comprehensive(
             custom_res_map, custom_elem_map = load_charge_map_file(charge_map_file)
             print(f"[INFO] 已加载自定义电荷表: {charge_map_file}")
         except Exception as e:
-            print(f"[WARN] 加载电荷表失败: {e}")
+            raise ValueError(
+                f"--charge_map_file 显式提供但加载失败: {charge_map_file} ({e})"
+            ) from e
     
     # 尝试残基估计
     if resnames is not None and resids is not None and HAS_UTILS:
@@ -1444,6 +1582,8 @@ def neutralize_by_residue(
         for cand in residue_candidates:
             if remaining <= 0:
                 break
+            if cand["charge"] > remaining:
+                continue
             group = cand["indices"]
             added_indices.extend(group)
             remaining -= cand["charge"]
@@ -1451,6 +1591,11 @@ def neutralize_by_residue(
                 f"添加残基 {cand['label']} ({len(group)} 原子, 距离 {cand['distance']:.2f} Å)"
             )
         
+        if remaining > 0:
+            info.append(
+                f"[WARN] 无法精确中和：剩余电荷 {remaining:+d}，已避免超量添加残基"
+            )
+
         if added_indices:
             new_indices = np.concatenate([selected_indices, np.array(added_indices)])
             new_indices = np.unique(new_indices)
@@ -1513,10 +1658,17 @@ def neutralize_by_residue(
     for cand in component_candidates:
         if remaining <= 0:
             break
+        if cand['charge'] > remaining:
+            continue
         added_all.extend(cand['indices'])
         remaining -= cand['charge']
         info.append(
             f"添加分量 {cand['label']} ({cand['size']} 原子, 电荷 {cand['signed_charge']:+d}, 距离 {cand['distance']:.2f} Å)"
+        )
+
+    if remaining > 0:
+        info.append(
+            f"[WARN] 无法精确中和：剩余电荷 {remaining:+d}，已避免超量添加分量"
         )
     
     if added_all:
@@ -1566,56 +1718,54 @@ def detect_atomic_clashes(
         clash_info: 包含 d_min, clash_count, clash_pairs, has_clashes
     """
     n_atoms = len(cluster)
-    symbols = cluster.get_chemical_symbols()
-    
+    if n_atoms < 2:
+        return {
+            'd_min': None,
+            'd_min_pair': None,
+            'clash_count': 0,
+            'clash_pairs': [],
+            'has_clashes': False
+        }
+
+    symbols = np.array(cluster.get_chemical_symbols(), dtype=object)
     dist_mat = cluster.get_all_distances(mic=use_mic)  # (N, N) 对称矩阵
-    
-    clash_pairs = []
-    d_min = float('inf')
-    d_min_pair = None
-    
-    # 遍历上三角矩阵（i < j）
-    for i in range(n_atoms):
-        for j in range(i + 1, n_atoms):
-            d_ij = dist_mat[i, j]
-            
-            # 更新最小距离
-            if d_ij < d_min:
-                d_min = d_ij
-                d_min_pair = (i, j)
-            
-            # 检测碰撞
-            sym_i, sym_j = symbols[i], symbols[j]
-            
-            # 方法1：基于共价半径比例
-            r_cov_i = COVALENT_RADII.get(sym_i, 1.0)
-            r_cov_j = COVALENT_RADII.get(sym_j, 1.0)
-            threshold_cov = (r_cov_i + r_cov_j) * scale
-            
-            # 方法2：全局硬阈值
-            if 'H' in (sym_i, sym_j):
-                threshold_global = global_min_h
-            else:
-                threshold_global = global_min_other
-            
-            # 取较小值（宽松策略：只抓严重重叠，避免误报）
-            threshold = min(threshold_cov, threshold_global)
-            
-            if d_ij < threshold:
-                clash_pairs.append({
-                    'i': int(i),
-                    'j': int(j),
-                    'sym_i': sym_i,
-                    'sym_j': sym_j,
-                    'distance': float(d_ij),
-                    'threshold': float(threshold)
-                })
-    
-    # 按距离排序
-    clash_pairs.sort(key=lambda x: x['distance'])
+    i_idx, j_idx = np.triu_indices(n_atoms, k=1)
+    pair_dist = dist_mat[i_idx, j_idx]
+
+    # 最小距离（上三角）
+    min_idx = int(np.argmin(pair_dist))
+    d_min = float(pair_dist[min_idx])
+    d_min_pair = (int(i_idx[min_idx]), int(j_idx[min_idx]))
+
+    # 向量化阈值
+    atom_radii = np.array([COVALENT_RADII.get(str(sym), 1.0) for sym in symbols], dtype=float)
+    threshold_cov = (atom_radii[i_idx] + atom_radii[j_idx]) * float(scale)
+    involves_h = np.logical_or(symbols[i_idx] == 'H', symbols[j_idx] == 'H')
+    threshold_global = np.where(involves_h, float(global_min_h), float(global_min_other))
+    threshold = np.minimum(threshold_cov, threshold_global)
+
+    clash_mask = pair_dist < threshold
+    clash_pairs: List[Dict[str, Any]] = []
+    if np.any(clash_mask):
+        clash_i = i_idx[clash_mask]
+        clash_j = j_idx[clash_mask]
+        clash_d = pair_dist[clash_mask]
+        clash_t = threshold[clash_mask]
+        order = np.argsort(clash_d)
+        for k in order:
+            ii = int(clash_i[k])
+            jj = int(clash_j[k])
+            clash_pairs.append({
+                'i': ii,
+                'j': jj,
+                'sym_i': str(symbols[ii]),
+                'sym_j': str(symbols[jj]),
+                'distance': float(clash_d[k]),
+                'threshold': float(clash_t[k])
+            })
     
     return {
-        'd_min': float(d_min) if d_min < float('inf') else None,
+        'd_min': d_min,
         'd_min_pair': d_min_pair,
         'clash_count': len(clash_pairs),
         'clash_pairs': clash_pairs[:20],  # 只保留前 20 个
@@ -2577,9 +2727,13 @@ def main():
     if args.neutralize == 'nearest_counterions':
         print("\n>>> 电荷中和...")
         temp_cluster = atoms[selected_indices]
-        current_charge, _, current_reliable, current_warnings = estimate_charge_comprehensive(
-            temp_cluster, use_mic, args.charge_map_file
-        )
+        try:
+            current_charge, _, current_reliable, current_warnings = estimate_charge_comprehensive(
+                temp_cluster, use_mic, args.charge_map_file
+            )
+        except ValueError as e:
+            print(f"    [ERROR] {e}")
+            sys.exit(1)
         neutralize_charge_before = current_charge
         neutralize_reliable_before = current_reliable
         neutralize_charge_after = current_charge
@@ -2608,9 +2762,13 @@ def main():
                 
                 # v2.3: 中和验证
                 temp_cluster_verify = atoms[selected_indices]
-                verify_charge, _, verify_reliable, verify_warnings = estimate_charge_comprehensive(
-                    temp_cluster_verify, use_mic, args.charge_map_file
-                )
+                try:
+                    verify_charge, _, verify_reliable, verify_warnings = estimate_charge_comprehensive(
+                        temp_cluster_verify, use_mic, args.charge_map_file
+                    )
+                except ValueError as e:
+                    print(f"    [ERROR] {e}")
+                    sys.exit(1)
                 neutralize_charge_after = verify_charge
                 neutralize_reliable_after = verify_reliable
                 remaining_charge = verify_charge - args.target_charge
@@ -2660,9 +2818,13 @@ def main():
         sys.exit(1)
     
     # 估算电荷
-    total_charge, elem_counts, charge_reliable, charge_warnings = estimate_charge_comprehensive(
-        cluster, use_mic, args.charge_map_file
-    )
+    try:
+        total_charge, elem_counts, charge_reliable, charge_warnings = estimate_charge_comprehensive(
+            cluster, use_mic, args.charge_map_file
+        )
+    except ValueError as e:
+        print(f"[ERROR] {e}")
+        sys.exit(1)
     if args.neutralize != 'none':
         neutralize_charge_after = total_charge
         neutralize_reliable_after = charge_reliable
@@ -2679,8 +2841,9 @@ def main():
     if args.mode == 'bulk':
         try:
             cluster, target_density, achieved_density, box_warnings = create_density_based_bulk_box(
-                cluster, original_density, args.density_g_cm3, use_mic,
+                cluster, original_density, args.density_g_cm3, args.mic_mode,
                 args.cell_shape, parent_cell,
+                parent_is_3d_density_valid=density_input_is_3d_valid,
                 span_padding=args.bulk_span_padding,
                 density_warn_pct=args.bulk_density_warn_pct,
                 clash_scale=args.clash_threshold_scale,
@@ -2700,30 +2863,48 @@ def main():
     
     cell = cluster.get_cell().lengths()
     print(f"    盒子: {cell[0]:.1f} x {cell[1]:.1f} x {cell[2]:.1f} Å")
+
+    # cell/pbc 改变后，MIC 必须基于当前结构重新解析
+    if args.mode == 'bulk':
+        try:
+            use_mic_after_box = resolve_use_mic(cluster, args.mic_mode)
+        except ValueError as e:
+            print(f"[ERROR] {e}")
+            sys.exit(1)
+    else:
+        # cluster+vacuum 为非周期边界，禁止 MIC 距离
+        use_mic_after_box = False
+    if use_mic_after_box != use_mic:
+        msg = (
+            "MIC 状态因当前 cell/pbc 更新而变化: "
+            f"selection={'on' if use_mic else 'off'} -> "
+            f"post_box={'on' if use_mic_after_box else 'off'}"
+        )
+        print(f"    [INFO] {msg}")
+        runtime_warnings.append(msg)
     
     # 切断键检测
     if n_cut_bonds > 0:
         print(f"\n[WARN] 检测到 {n_cut_bonds} 个切断的化学键！")
         print("[INFO] 建议: 增大半径 / 使用 --bond_hops / molecule 模式")
         
-        # 写入报告
-        if HAS_UTILS:
-            os.makedirs(args.outdir, exist_ok=True)
-            positions = atoms.get_positions()
-            symbols = atoms.get_chemical_symbols()
-            valid_cell = use_mic and has_valid_cell_for_mic(atoms)
-            cell_arr = atoms.cell if valid_cell else None
-            pbc_arr = atoms.pbc if valid_cell else None
-            graph = build_bond_graph(positions, symbols, cell_arr, pbc_arr)
-            cut_bonds = detect_cut_bonds(graph, set(selected_indices))
-            write_cut_bonds_report(
-                os.path.join(args.outdir, 'cut_bonds_report.txt'),
-                cut_bonds, symbols, positions, cell_arr
-            )
+        # 写入报告（utils/fallback 都支持）
+        os.makedirs(args.outdir, exist_ok=True)
+        positions = atoms.get_positions()
+        symbols = atoms.get_chemical_symbols()
+        valid_cell = use_mic and has_valid_cell_for_mic(atoms)
+        cell_arr = atoms.cell if valid_cell else None
+        pbc_arr = atoms.pbc if valid_cell else None
+        graph = build_bond_graph(positions, symbols, cell_arr, pbc_arr)
+        cut_bonds = detect_cut_bonds(graph, set(selected_indices))
+        write_cut_bonds_report(
+            os.path.join(args.outdir, 'cut_bonds_report.txt'),
+            cut_bonds, symbols, positions, cell_arr
+        )
     
     # v2.3: 碰撞检测
     print("\n>>> 碰撞检测...")
-    clash_info = detect_atomic_clashes(cluster, use_mic=use_mic, scale=args.clash_threshold_scale)
+    clash_info = detect_atomic_clashes(cluster, use_mic=use_mic_after_box, scale=args.clash_threshold_scale)
     
     if clash_info['d_min'] is not None:
         print(f"    最小原子间距: {clash_info['d_min']:.3f} Å")

@@ -457,12 +457,16 @@ salt_solution:
 
 **v2.4.1 关键点**：
 - ✅ `--mic_mode {auto,on,off}` 显式控制 MIC，默认 `auto`
-- ✅ `resolve_use_mic()` 是唯一 MIC 决策入口，选择/重成像/中和距离排序/碰撞检测共享同一结果
+- ✅ `resolve_use_mic()` 负责 MIC 决策；建盒后会基于**当前** `cell/pbc` 重新解析（避免使用过期 MIC 状态）
 - ✅ `--mic_mode on` 在输入 cell/pbc 无效时会直接报错退出，不再静默回退
 - ✅ `model_meta.json` 记录真实的 `density_input_is_3d_valid`、`mic_mode`、`mic_used_for_selection`、`mic_cell_valid`
 - ✅ `model_meta.json` 记录中和前后电荷与可靠性：`charge_before/after`、`reliable_before/after`
 - ✅ cluster 输出盒子始终设置 `pbc=[False,False,False]`，并在元数据中显式记录
 - ✅ bulk 盒子仍按 `V_target = M_sub / ρ_target` 构建，必要时自动扩胞避免自交叠
+- ✅ `cell_shape=scale_parent` 在输入不是有效 3D 周期密度来源时会明确警告并回退到 `cubic`
+- ✅ `--charge_map_file` 显式提供但加载失败时会直接报错退出（不再静默回退）
+- ✅ `parse_poscar_element_order()` 兼容 VASP5/VASP4（含确定性回退路径）
+- ✅ 无 `utils` 模块时，检测到切断键仍会写出 `cut_bonds_report.txt`
 
 **物理原理**：
 ```
@@ -541,7 +545,7 @@ python3 setup_aimd_ase.py --src system.pdb --center_atom Li --radius 8 --selecti
 - `--mic_mode auto`：仅当输入结构通过 `has_valid_cell_for_mic()` 检查时启用 MIC
 - `--mic_mode on`：要求输入结构具备有效周期性 cell；否则会以非零状态退出，并打印检测到的 `pbc`、`cell`、失败原因和修复建议
 - `--mic_mode off`：选择、重成像、中和距离排序、碰撞检测全部使用非 MIC 距离
-- 同一次运行里不会出现“选择用了 MIC，但中和/碰撞检测没用”的混搭行为
+- 建盒后会按**当前**结构重新判断 MIC：`bulk` 有效周期盒会启用 MIC；`cluster+vacuum`（`pbc=False`）会禁用 MIC
 
 ### 选择模式
 
@@ -616,6 +620,8 @@ aimd_Li8A/
 - 对多原子分量，不做“元素求和”电荷回退（避免化学上不安全的估计）
 - 若 `--neutralize nearest_counterions` 且电荷估计不可靠，脚本会直接报错并终止：
   - `Provide residue info in the input OR supply --charge_map_file OR disable --neutralize.`
+- 若显式提供 `--charge_map_file` 但文件不存在/解析失败，脚本会直接报错退出（不再静默回退）
+- 中和时会避免“超量添加”反离子分量；若无法精确达到目标电荷，会给出剩余电荷诊断
 - 若启用中和，`model_meta.json` 会记录中和前后电荷、可靠性和剩余电荷，便于回溯
 
 ### 完整工作流
@@ -653,7 +659,7 @@ python3 aimd_msd.py --specie Li --dt_fs 2.0
 
 - **含 H 原子**：时间步长建议 0.5-1.0 fs（默认 2.0 可能过大）
 
-- **PBC/MIC 处理**：默认 `--mic_mode auto`。若输入是有效周期性体系，选择/重成像/中和排序/碰撞检测都会使用 MIC；若输入无效则全流程禁用。用 `--mic_mode on/off` 可显式覆盖。
+- **PBC/MIC 处理**：默认 `--mic_mode auto`。选择阶段先按输入结构判断 MIC；建盒后会按当前 `cell/pbc` 重新判断（bulk 周期盒启用，cluster+vacuum 禁用）。用 `--mic_mode on/off` 可显式覆盖输入阶段策略。
 
 - **bulk 密度来源约束**：当 `--mode bulk` 且未指定 `--density_g_cm3` 时，输入必须是有效 3D 周期体系（`pbc=[T,T,T]` 且 cell 有效）；否则会报错
 
