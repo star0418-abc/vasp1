@@ -735,6 +735,9 @@ python3 aimd_msd.py --specie Li --dt_fs 1.0 --t_skip_ps 2.0 --t_fit_start_ps 5.0
 # 分段独立误差估计
 python3 aimd_msd.py --specie Li --dt_fs 1.0 --n_blocks 4
 
+# 2D 扩散体系（slab/平面约束）建议显式设置 d=2
+python3 aimd_msd.py --specie Li --dt_fs 1.0 --diff_dim 2
+
 # 线性 COM 漂移去除（保留涨落，推荐）
 python3 aimd_msd.py --specie Li --dt_fs 1.0 --remove_com all_linear
 
@@ -759,7 +762,7 @@ python3 aimd_msd.py --self_check
 
 **输出文件**：
 - `msd_Li.dat`: MSD 数据（lag_ps, MSD_A2, n_samples）
-- `D_running_Li.dat`: Running-D（D_ratio + D_deriv）
+- `D_running_Li.dat`: Running-D（由 `--runningD` 控制：`ratio`/`derivative`/`both`）
 - `alpha_Li.dat`: log-log 斜率 α(t)
 - `msd_report.txt`: 完整分析报告
 
@@ -780,15 +783,20 @@ MTO MSD 公式:
 
 **v2.3 分析语义（重要）**：
 - `stride` 下不再假设 `t = arange(N)*dt`，统一使用 `lag_frames * dt` 时间轴。
-- Bootstrap 与主流程使用**同一组 lag 帧**与同一物理 `max_lag_frames`，避免 stride 下的时间轴错误。
-- Trajectory blocks 不再按 block 内长度比例取拟合窗，而是复用主流程的**绝对时间窗口（ps）**；过短 block 会被跳过并记录原因。
+- Bootstrap 与主流程使用**同一组 lag 帧**与同一物理 `max_lag_frames`，避免 stride 下的时间轴错误；SEM 使用**有效 bootstrap 样本数**。
+- Trajectory blocks 使用每个 block 的**本地可用时间窗口**做拟合窗校验，不再因全局 fit_end 导致短 block 被整体误跳过。
+- Block/Bootstrap 不再静默丢弃非正 `D` 样本（避免均值上偏）；若出现非正样本会在日志中显式报告保留数量。
+- XDATCAR 解析改为严格 frame 边界：遇到损坏/截断帧会**明确报错退出**，不会继续“滑动重同步”并伪造后续轨迹。
 - 读取 XDATCAR 后（应用 `--skip` 之后）会自动删除**连续重复帧**（常见于 RESUME 拼接），并打印删除数量与位置。
 - `remove_com=all/selected` 为每帧锚定，可能抑制真实长波涨落；更推荐 `all_linear/selected_linear` 仅去除线性漂移。
-- OUTCAR 变胞检测现在同时检查**晶格长度 / 3x3 矩阵分量 / 体积 / 角度（默认启用）**，阈值由 `--cell_rel_std_tol` 控制。
+- OUTCAR 变胞检测现在同时检查**晶格长度 / 3x3 矩阵分量 / 体积 / 角度（默认启用）**，阈值由 `--cell_rel_std_tol` 控制；状态会明确区分为 `constant confirmed` / `variable detected` / `unknown`。
+- `--require_valid_cell_check` 可在 cell-check 为 unknown（OUTCAR 缺失/损坏/不足）时强制失败，避免流水线误把 unknown 当 constant。
 - `--t_skip_ps` 若被 `<=25%` lag-window 安全上限截断，会在终端和 `msd_report.txt` 同时记录明确 warning。
 - `msd_report.txt` 现在包含重复帧去重摘要、COM 参考来源、strict 标志、cell check 消息以及最终 `SUMMARY` 机器可读行。
+- Einstein 分母支持显式维度 `d`：`D = slope / (2d)`（默认 `d=3`，2D 体系可用 `--diff_dim 2`）。
+- `--runningD` 与 `--plateau_method` 现在会真实控制计算/写出/判定路径，不再总是固定走 “both”。
 
-> ⚠️ **重要 (v2.3)**：若检测到亚扩散（α < 0.8），脚本默认**不输出 D** 并以**退出码 2** 终止。这防止自动化流水线静默获取无效 D 值。使用 `--allow_unreliable_D` 或 `--no_strict` 可覆盖此行为。
+> ⚠️ **重要 (v2.3)**：严格模式下，只有当启用了 alpha 判定（`--plateau_method alpha/both`）且检测到亚扩散（α < 0.8）时，脚本才会将 D 设为 NaN 并以退出码 2 终止。其他不可靠原因（如 drifting/α不可用）不会被误标为 subdiffusion exit(2)。
 
 **v2.3 关键改进**：
 
@@ -815,12 +823,16 @@ MTO MSD 公式:
 | `--com_index_file` | - | COM 参考索引文件（覆盖 `--com_selection`） |
 | `--msd_method` | mto | mto / single_origin |
 | `--stride` | 1 | MTO lag 步进（2/5 可降低计算量） |
+| `--runningD` | both | Running-D 输出路径: ratio / derivative / both |
+| `--plateau_method` | both | 平台判定路径: D_derivative / alpha / both |
+| `--diff_dim` | 3 | 扩散维度 d（Einstein 分母 2d） |
 | `--max_lag_ps` | min(T×0.5, 10) | 智能默认，避免噪声 |
 | `--unwrap_check` | 启用 | 检测 \|d\|>0.5 分数坐标跳跃 |
 | `--remove_com` | all | COM 漂移去除: none/all/selected/all_linear/selected_linear |
 | `--duplicate_tol` | 1e-12 | 连续重复帧判定阈值（分数坐标） |
 | `--alpha_window` | 21 | α(t) 滑窗大小 |
 | `--block_mode` | trajectory_blocks | trajectory_blocks/bootstrap |
+| `--require_valid_cell_check` | False | 若 OUTCAR 校验不可用（unknown）则失败退出 |
 | `--seed` | - | Bootstrap 随机种子 |
 | `--self_check` | False | 运行内置轻量自检并退出 |
 

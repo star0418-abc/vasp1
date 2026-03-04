@@ -74,8 +74,8 @@ Change Summary (v2.1):
    - Prevents global drift from inflating MSD
    
 6. [NEW] Both D_ratio and D_derivative
-   - D_ratio = MSD/(6t)
-   - D_deriv = (1/6) d(MSD)/dt (more reliable for plateau)
+   - D_ratio = MSD/(2*d*t)
+   - D_deriv = (1/2d) d(MSD)/dt (more reliable for plateau)
 
 ================================================================================
 
@@ -270,6 +270,7 @@ def analyze_cell_variability(
         'tolerance': float(tolerance),
         'check_angles': bool(check_angles),
         'found_outcar': os.path.isfile(outcar_path),
+        'validation_state': 'unknown',  # confirmed_constant | variable_detected | unknown
         'n_snapshots': 0,
         'is_variable': False,
         'max_rel_std': 0.0,
@@ -283,7 +284,7 @@ def analyze_cell_variability(
 
     if not details['found_outcar']:
         details['message'] = (
-            f"OUTCAR not found, assuming constant cell "
+            f"Cell variability unknown: OUTCAR not found "
             f"(cell_rel_std_tol={tolerance:.4f})"
         )
         return details
@@ -293,7 +294,7 @@ def analyze_cell_variability(
         details['n_snapshots'] = len(cell_matrices)
         if len(cell_matrices) < 2:
             details['message'] = (
-                f"Insufficient lattice data in OUTCAR "
+                f"Cell variability unknown: insufficient lattice data in OUTCAR "
                 f"(snapshots={len(cell_matrices)}, cell_rel_std_tol={tolerance:.4f})"
             )
             return details
@@ -348,9 +349,10 @@ def analyze_cell_variability(
             if trigger_metrics else
             f"; dominant={max_metric_name}"
         )
-        status = "Variable cell detected" if is_variable else "Constant cell"
+        status = "Variable cell detected" if is_variable else "Constant cell confirmed"
         details.update({
             'is_variable': is_variable,
+            'validation_state': 'variable_detected' if is_variable else 'confirmed_constant',
             'max_rel_std': float(max_rel_std),
             'trigger_metrics': trigger_metrics,
             'length_rel_std_max': length_rel_std_max,
@@ -365,7 +367,7 @@ def analyze_cell_variability(
         return details
 
     except Exception as exc:
-        details['message'] = f"Error parsing OUTCAR: {exc}"
+        details['message'] = f"Cell variability unknown: error parsing OUTCAR: {exc}"
         return details
 
 
@@ -415,6 +417,7 @@ def format_summary_line(
     strict: bool,
     allow_unreliable_D: bool,
     cell_is_variable: bool,
+    cell_validation_state: str,
     cell_rel_std: float,
     cell_rel_std_tol: float,
     duplicate_frames_removed: int,
@@ -438,6 +441,7 @@ def format_summary_line(
         f"strict={int(strict)}",
         f"allow_unreliable_D={int(allow_unreliable_D)}",
         f"cell_variable={int(cell_is_variable)}",
+        f"cell_validation_state={cell_validation_state}",
         f"cell_max_rel_std={cell_rel_std:.6f}",
         f"cell_rel_std_tol={cell_rel_std_tol:.6f}",
         f"duplicate_frames_removed={duplicate_frames_removed}",
@@ -468,53 +472,98 @@ def parse_xdatcar(filepath: str) -> Tuple[np.ndarray, List[str], List[int], List
     with open(filepath, 'r') as f:
         lines = f.readlines()
 
-    if len(lines) < 8:
-        print(f"[ERROR] XDATCAR 文件格式错误: {filepath}")
-        sys.exit(1)
+    def parse_frac_triplet(line: str, line_no: int) -> np.ndarray:
+        tokens = line.split()
+        if len(tokens) < 3:
+            raise ValueError(
+                f"line {line_no}: expected 3 fractional coordinates, got {len(tokens)} tokens"
+            )
+        try:
+            return np.array([float(tokens[0]), float(tokens[1]), float(tokens[2])], dtype=float)
+        except ValueError as exc:
+            raise ValueError(
+                f"line {line_no}: invalid fractional coordinate triplet: '{line.strip()}'"
+            ) from exc
 
-    scale = float(lines[1].strip())
-    lattice = np.zeros((3, 3))
-    for i in range(3):
-        lattice[i] = [float(x) for x in lines[2 + i].split()]
-    lattice *= scale
+    try:
+        if len(lines) < 8:
+            raise ValueError("file too short for XDATCAR header + one frame")
 
-    species = lines[5].split()
-    counts = [int(x) for x in lines[6].split()]
-    natoms = sum(counts)
+        # Header (strict VASP5-style only). Fail clearly on unsupported formats.
+        try:
+            scale = float(lines[1].strip())
+        except ValueError as exc:
+            raise ValueError(
+                f"line 2: invalid global scaling factor '{lines[1].strip()}'"
+            ) from exc
 
-    frames = []
-    idx = 7
+        lattice = np.zeros((3, 3), dtype=float)
+        for i in range(3):
+            line_no = 3 + i
+            vec = parse_frac_triplet(lines[2 + i], line_no)
+            lattice[i] = vec
+        lattice *= scale
 
-    while idx < len(lines):
-        line = lines[idx].strip()
-        if line.startswith("Direct") or line.startswith("direct") or "configuration" in line.lower():
-            idx += 1
-            continue
+        species = lines[5].split()
+        count_tokens = lines[6].split()
+        if len(species) == 0:
+            raise ValueError("line 6: missing species list (only VASP5-style XDATCAR is supported)")
+        if len(count_tokens) == 0:
+            raise ValueError("line 7: missing atom counts")
+        try:
+            counts = [int(x) for x in count_tokens]
+        except ValueError as exc:
+            raise ValueError(
+                "line 7: invalid atom counts; unsupported XDATCAR header (expect VASP5-style species + counts)"
+            ) from exc
+        if len(species) != len(counts):
+            raise ValueError(
+                f"header mismatch: {len(species)} species but {len(counts)} count entries"
+            )
+        natoms = sum(counts)
+        if natoms <= 0:
+            raise ValueError(f"invalid total atom count: {natoms}")
 
-        if idx + natoms > len(lines):
-            break
+        # Frames: strict parse by frame boundaries; no silent resync on corruption.
+        frames: List[np.ndarray] = []
+        idx = 7
+        while idx < len(lines):
+            line = lines[idx].strip()
+            if not line:
+                idx += 1
+                continue
 
-        frame = np.zeros((natoms, 3))
-        valid_frame = True
-        for i in range(natoms):
-            try:
-                coords = lines[idx + i].split()[:3]
-                frame[i] = [float(c) for c in coords]
-            except (ValueError, IndexError):
-                valid_frame = False
-                break
+            line_lower = line.lower()
+            has_header = line_lower.startswith("direct") or ("configuration" in line_lower)
+            if has_header:
+                header_line_no = idx + 1
+                idx += 1
+                if idx >= len(lines):
+                    raise ValueError(f"frame header at line {header_line_no} has no coordinates")
 
-        if valid_frame:
+            if idx + natoms > len(lines):
+                raise ValueError(
+                    f"truncated frame at line {idx + 1}: need {natoms} coordinate lines, "
+                    f"have {len(lines) - idx}"
+                )
+
+            frame = np.zeros((natoms, 3), dtype=float)
+            for i in range(natoms):
+                line_no = idx + i + 1
+                frame[i] = parse_frac_triplet(lines[idx + i], line_no)
+
             frames.append(frame)
             idx += natoms
-        else:
-            idx += 1
 
-    if len(frames) == 0:
-        print(f"[ERROR] 未能从 XDATCAR 读取任何帧")
+        if len(frames) == 0:
+            raise ValueError("no frames parsed from XDATCAR body")
+
+        return lattice, species, counts, frames
+
+    except ValueError as exc:
+        print(f"[ERROR] XDATCAR parse failed: {exc}")
+        print("[ERROR] Parser uses strict frame boundaries and does not resynchronize after corruption.")
         sys.exit(1)
-
-    return lattice, species, counts, frames
 
 
 def get_species_indices(species: List[str], counts: List[int], target: str) -> np.ndarray:
@@ -824,7 +873,29 @@ def remove_com_drift(
     com_drift = com_cart_shift[-1]
 
     # Convert COM correction to fractional coordinates and remove from all atoms.
-    lattice_inv = np.linalg.inv(lattice)
+    try:
+        cond = float(np.linalg.cond(lattice))
+    except np.linalg.LinAlgError as exc:
+        raise ValueError(f"Invalid lattice matrix for COM removal: {exc}") from exc
+
+    use_pinv = (not np.isfinite(cond)) or cond > 1e10
+    if use_pinv:
+        print(
+            f"    [WARN] Lattice matrix is ill-conditioned for COM correction "
+            f"(cond={cond:.3e}); using pseudo-inverse"
+        )
+        lattice_inv = np.linalg.pinv(lattice)
+    else:
+        try:
+            lattice_inv = np.linalg.inv(lattice)
+        except np.linalg.LinAlgError as exc:
+            rank = int(np.linalg.matrix_rank(lattice))
+            if rank < 3:
+                raise ValueError(
+                    f"Lattice matrix is singular (rank={rank}); cannot apply COM drift removal safely"
+                ) from exc
+            print("    [WARN] Lattice inversion failed unexpectedly; using pseudo-inverse for COM correction")
+            lattice_inv = np.linalg.pinv(lattice)
     com_frac_drift = np.dot(com_cart_shift, lattice_inv)  # (nframes, 3)
     corrected_frac = unwrapped_frac - com_frac_drift[:, np.newaxis, :]
     
@@ -976,32 +1047,34 @@ def select_time_origins(
 # Running D 计算
 # ==============================================================================
 
-def compute_running_D_ratio(t_ps: np.ndarray, msd: np.ndarray) -> np.ndarray:
+def compute_running_D_ratio(t_ps: np.ndarray, msd: np.ndarray, diff_dim: int = 3) -> np.ndarray:
     """
-    计算 Running D (ratio): D(t) = MSD(t) / (6t)
+    计算 Running D (ratio): D(t) = MSD(t) / (2*d*t)
     
     单位: cm²/s (1 Å²/ps = 1e-4 cm²/s)
     """
-    D_ratio = np.zeros_like(msd)
+    D_ratio = np.zeros_like(msd, dtype=float)
+    denom = 2.0 * float(diff_dim)
     D_ratio[0] = 0
-    D_ratio[1:] = msd[1:] / (6.0 * t_ps[1:]) * 1e-4
+    D_ratio[1:] = msd[1:] / (denom * t_ps[1:]) * 1e-4
     return D_ratio
 
 
 def compute_running_D_derivative(
     t_ps: np.ndarray,
     msd: np.ndarray,
-    smooth_window: int = 5
+    smooth_window: int = 5,
+    diff_dim: int = 3
 ) -> np.ndarray:
     """
-    计算 Running D (derivative): D(t) = (1/6) d(MSD)/dt
+    计算 Running D (derivative): D(t) = (1/2d) d(MSD)/dt
     
     使用中心差分 + 可选平滑
     
     单位: cm²/s
     """
     n = len(msd)
-    D_deriv = np.zeros(n)
+    D_deriv = np.zeros(n, dtype=float)
     
     if n < 3:
         return D_deriv
@@ -1009,11 +1082,12 @@ def compute_running_D_derivative(
     dt = t_ps[1] - t_ps[0] if len(t_ps) > 1 else 1.0
     
     # 中心差分
-    D_deriv[1:-1] = (msd[2:] - msd[:-2]) / (2 * dt) / 6.0
+    denom = 2.0 * float(diff_dim)
+    D_deriv[1:-1] = (msd[2:] - msd[:-2]) / (2 * dt) / denom
     
     # 边界处理
     D_deriv[0] = 0
-    D_deriv[-1] = (msd[-1] - msd[-2]) / dt / 6.0
+    D_deriv[-1] = (msd[-1] - msd[-2]) / dt / denom
     
     # 可选平滑
     if smooth_window > 1 and n >= smooth_window:
@@ -1149,7 +1223,8 @@ def estimate_D_with_trajectory_blocks(
     skip_ps: float = 0.0,
     stride: int = 1,
     max_lag_frames: Optional[int] = None,
-    min_samples: int = 5
+    min_samples: int = 5,
+    diff_dim: int = 3
 ) -> Tuple[float, float, float, List[float]]:
     """
     Trajectory blocks 误差估计（正确实现）
@@ -1203,10 +1278,13 @@ def estimate_D_with_trajectory_blocks(
         fit_end_idx_global = min(len(global_t_ps) - 1, max(1, int(len(global_t_ps) * fit_end_frac)))
         fit_end_ps = float(global_t_ps[fit_end_idx_global])
 
-    fit_start_ps = max(float(skip_ps), float(fit_start_ps))
-    fit_end_ps = max(fit_end_ps, fit_start_ps)
+    requested_fit_start_ps = max(float(skip_ps), float(fit_start_ps))
+    requested_fit_end_ps = max(float(fit_end_ps), requested_fit_start_ps)
 
-    print(f"    [INFO] Trajectory blocks fit window (absolute): {fit_start_ps:.3f} ~ {fit_end_ps:.3f} ps")
+    print(
+        "    [INFO] Trajectory blocks fit window (requested absolute): "
+        f"{requested_fit_start_ps:.3f} ~ {requested_fit_end_ps:.3f} ps"
+    )
 
     # v2.2: Physical minimum time check instead of frame-based
     min_block_frames = int(np.ceil(min_block_time_ps / dt_ps))
@@ -1218,7 +1296,8 @@ def estimate_D_with_trajectory_blocks(
         print(f"[WARN] Increase trajectory length or reduce n_blocks")
         return np.nan, np.nan, np.nan, []
     
-    D_blocks = []
+    D_blocks: List[float] = []
+    nonpositive_blocks = 0
     
     for i in range(n_blocks):
         start_frame = i * block_size
@@ -1268,16 +1347,27 @@ def estimate_D_with_trajectory_blocks(
             print(f"    [WARN] block {i+1}/{n_blocks} skipped: empty time axis")
             continue
 
-        if t_block_ps[-1] + 1e-12 < fit_end_ps:
+        block_t_max = float(t_block_ps[-1])
+        if block_t_max <= requested_fit_start_ps:
             print(
                 f"    [INFO] block {i+1}/{n_blocks} skipped: "
-                f"max time {t_block_ps[-1]:.3f} ps < fit_end {fit_end_ps:.3f} ps"
+                f"max time {block_t_max:.3f} ps <= fit_start {requested_fit_start_ps:.3f} ps"
+            )
+            continue
+
+        # Use per-block local fit window to avoid invalidating short-but-usable blocks.
+        local_fit_start_ps = requested_fit_start_ps
+        local_fit_end_ps = min(requested_fit_end_ps, block_t_max)
+        if local_fit_end_ps <= local_fit_start_ps:
+            print(
+                f"    [INFO] block {i+1}/{n_blocks} skipped: "
+                f"local fit window empty ({local_fit_start_ps:.3f}, {local_fit_end_ps:.3f}) ps"
             )
             continue
 
         skip_idx_block = ps_to_index(skip_ps, t_block_ps, side='left')
-        fit_start_idx = max(skip_idx_block, ps_to_index(fit_start_ps, t_block_ps, side='left'))
-        fit_end_idx = ps_to_index(fit_end_ps, t_block_ps, side='right')
+        fit_start_idx = max(skip_idx_block, ps_to_index(local_fit_start_ps, t_block_ps, side='left'))
+        fit_end_idx = ps_to_index(local_fit_end_ps, t_block_ps, side='right')
         fit_end_idx = min(fit_end_idx, len(msd_block))
 
         if fit_end_idx - fit_start_idx < 5:
@@ -1289,14 +1379,21 @@ def estimate_D_with_trajectory_blocks(
         msd_fit = msd_block[fit_start_idx:fit_end_idx]
         
         _, slope, _ = linear_fit(t_fit, msd_fit)
-        D_block = slope / 6.0 * 1e-4  # Å²/ps -> cm²/s
-        
-        if D_block > 0:
-            D_blocks.append(D_block)
-    
+        D_block = slope / (2.0 * float(diff_dim)) * 1e-4  # Å²/ps -> cm²/s
+        if np.isfinite(D_block):
+            D_blocks.append(float(D_block))
+            if D_block <= 0:
+                nonpositive_blocks += 1
+
     if len(D_blocks) < 2:
         print(f"    [WARN] only {len(D_blocks)} valid blocks remain; need >=2 for uncertainty")
         return np.nan, np.nan, np.nan, D_blocks
+
+    if nonpositive_blocks > 0:
+        print(
+            f"    [INFO] retained {nonpositive_blocks} non-positive block D samples "
+            f"(no positive-only filtering applied)"
+        )
     
     D_mean = np.mean(D_blocks)
     D_std = np.std(D_blocks, ddof=1)
@@ -1316,8 +1413,9 @@ def estimate_D_with_bootstrap(
     fit_end_idx: int,
     n_bootstrap: int = 100,
     seed: Optional[int] = None,
-    min_samples: int = 5
-) -> Tuple[float, float, float, float]:
+    min_samples: int = 5,
+    diff_dim: int = 3
+) -> Tuple[float, float, float, float, int]:
     """
     Bootstrap 误差估计
     
@@ -1328,6 +1426,7 @@ def estimate_D_with_bootstrap(
         D_std: 标准差
         D_ci_low: 95% CI 下界
         D_ci_high: 95% CI 上界
+        n_valid: 有效 bootstrap 样本数
     """
     if seed is not None:
         np.random.seed(seed)
@@ -1335,12 +1434,13 @@ def estimate_D_with_bootstrap(
     lag_frames = np.asarray(lag_frames, dtype=int)
     lag_frames = np.unique(lag_frames[lag_frames >= 0])
     if len(lag_frames) == 0:
-        return np.nan, np.nan, np.nan, np.nan
+        return np.nan, np.nan, np.nan, np.nan, 0
 
     max_lag_frames = int(np.max(lag_frames))
     
     n_origins = len(all_origins)
-    D_bootstrap = []
+    D_bootstrap: List[float] = []
+    nonpositive_count = 0
     
     for _ in range(n_bootstrap):
         # 有放回重采样
@@ -1372,20 +1472,28 @@ def estimate_D_with_bootstrap(
         t_fit = t_ps[fit_start_idx:fit_end_idx_eff]
         msd_fit = msd[fit_start_idx:fit_end_idx_eff]
         _, slope, _ = linear_fit(t_fit, msd_fit)
-        D = slope / 6.0 * 1e-4
+        D = slope / (2.0 * float(diff_dim)) * 1e-4
         
-        if D > 0:
-            D_bootstrap.append(D)
+        if np.isfinite(D):
+            D_bootstrap.append(float(D))
+            if D <= 0:
+                nonpositive_count += 1
     
     if len(D_bootstrap) < 10:
-        return np.nan, np.nan, np.nan, np.nan
+        return np.nan, np.nan, np.nan, np.nan, len(D_bootstrap)
+
+    if nonpositive_count > 0:
+        print(
+            f"    [INFO] retained {nonpositive_count} non-positive bootstrap D samples "
+            f"(no positive-only filtering applied)"
+        )
     
     D_mean = np.mean(D_bootstrap)
     D_std = np.std(D_bootstrap, ddof=1)
     D_ci_low = np.percentile(D_bootstrap, 2.5)
     D_ci_high = np.percentile(D_bootstrap, 97.5)
     
-    return D_mean, D_std, D_ci_low, D_ci_high
+    return D_mean, D_std, D_ci_low, D_ci_high, len(D_bootstrap)
 
 
 # ==============================================================================
@@ -1423,6 +1531,49 @@ def linear_fit(x: np.ndarray, y: np.ndarray) -> Tuple[float, float, float]:
     return intercept, slope, max(0, min(1, r_squared))
 
 
+def alpha_stats_in_fit_window(
+    alpha: np.ndarray,
+    t_alpha: np.ndarray,
+    t_ps: np.ndarray,
+    fit_start_idx: int,
+    fit_end_idx: int
+) -> Tuple[float, float]:
+    """Return alpha mean/std inside fit window."""
+    if len(t_alpha) == 0 or len(alpha) == 0:
+        return np.nan, np.nan
+
+    t_fit_start = float(t_ps[fit_start_idx])
+    t_fit_end = float(t_ps[fit_end_idx - 1] if fit_end_idx > 0 else t_ps[-1])
+    alpha_mask = (t_alpha >= t_fit_start) & (t_alpha <= t_fit_end) & (~np.isnan(alpha))
+    alpha_in_fit = alpha[alpha_mask]
+    if len(alpha_in_fit) == 0:
+        return np.nan, np.nan
+
+    return float(np.mean(alpha_in_fit)), float(np.std(alpha_in_fit))
+
+
+def compute_derivative_drift_ratio(
+    D_deriv: np.ndarray,
+    t_ps: np.ndarray,
+    fit_start_idx: int,
+    fit_end_idx: int
+) -> float:
+    """Compute drift ratio from running derivative D(t) in fit window."""
+    D_fit = D_deriv[fit_start_idx:fit_end_idx]
+    t_fit = t_ps[fit_start_idx:fit_end_idx]
+    if len(D_fit) < 3:
+        return np.nan
+
+    _, slope, _ = linear_fit(t_fit, D_fit)
+    mean_D = float(np.mean(D_fit))
+    if mean_D <= 0:
+        return 1.0
+
+    time_span = float(t_fit[-1] - t_fit[0])
+    total_drift = abs(slope * time_span)
+    return float(total_drift / abs(mean_D))
+
+
 def check_plateau_combined(
     D_deriv: np.ndarray,
     t_ps: np.ndarray,
@@ -1442,39 +1593,12 @@ def check_plateau_combined(
         message: 判定消息
     """
     # 1. D_deriv 漂移率
-    D_fit = D_deriv[fit_start_idx:fit_end_idx]
-    t_fit = t_ps[fit_start_idx:fit_end_idx]
-    
-    if len(D_fit) < 3:
+    drift_ratio = compute_derivative_drift_ratio(D_deriv, t_ps, fit_start_idx, fit_end_idx)
+    if np.isnan(drift_ratio):
         return "insufficient_data", 1.0, np.nan, np.nan, "拟合区间数据不足"
-    
-    _, slope, _ = linear_fit(t_fit, D_fit)
-    mean_D = np.mean(D_fit)
-    
-    if mean_D <= 0:
-        drift_ratio = 1.0
-    else:
-        time_span = t_fit[-1] - t_fit[0]
-        total_drift = abs(slope * time_span)
-        drift_ratio = total_drift / abs(mean_D)
-    
+
     # 2. Alpha 在拟合区间的统计
-    if len(t_alpha) > 0 and len(alpha) > 0:
-        t_fit_start = t_ps[fit_start_idx]
-        t_fit_end = t_ps[fit_end_idx - 1] if fit_end_idx > 0 else t_ps[-1]
-        
-        alpha_mask = (t_alpha >= t_fit_start) & (t_alpha <= t_fit_end) & (~np.isnan(alpha))
-        alpha_in_fit = alpha[alpha_mask]
-        
-        if len(alpha_in_fit) > 0:
-            alpha_mean = np.mean(alpha_in_fit)
-            alpha_std = np.std(alpha_in_fit)
-        else:
-            alpha_mean = np.nan
-            alpha_std = np.nan
-    else:
-        alpha_mean = np.nan
-        alpha_std = np.nan
+    alpha_mean, alpha_std = alpha_stats_in_fit_window(alpha, t_alpha, t_ps, fit_start_idx, fit_end_idx)
     
     # 3. 综合判定
     drift_ok = drift_ratio < 0.2
@@ -1506,6 +1630,47 @@ def check_plateau_combined(
     return verdict, drift_ratio, alpha_mean, alpha_std, message
 
 
+def check_plateau_by_method(
+    method: str,
+    D_deriv: Optional[np.ndarray],
+    t_ps: np.ndarray,
+    alpha: np.ndarray,
+    t_alpha: np.ndarray,
+    fit_start_idx: int,
+    fit_end_idx: int
+) -> Tuple[str, float, float, float, str]:
+    """Plateau assessment honoring CLI --plateau_method."""
+    if method == 'both':
+        if D_deriv is None:
+            return "insufficient_data", np.nan, np.nan, np.nan, "D_derivative 未计算，无法执行 both 判定"
+        return check_plateau_combined(D_deriv, t_ps, alpha, t_alpha, fit_start_idx, fit_end_idx)
+
+    if method == 'D_derivative':
+        if D_deriv is None:
+            return "insufficient_data", np.nan, np.nan, np.nan, "D_derivative 未计算，无法判定"
+        drift_ratio = compute_derivative_drift_ratio(D_deriv, t_ps, fit_start_idx, fit_end_idx)
+        if np.isnan(drift_ratio):
+            return "insufficient_data", np.nan, np.nan, np.nan, "拟合区间数据不足"
+        verdict = "credible" if drift_ratio < 0.2 else "drifting"
+        msg = (
+            f"D_derivative 判定: {'稳定' if verdict == 'credible' else '漂移'} "
+            f"(drift={drift_ratio*100:.1f}%%)"
+        )
+        return verdict, drift_ratio, np.nan, np.nan, msg
+
+    if method == 'alpha':
+        alpha_mean, alpha_std = alpha_stats_in_fit_window(alpha, t_alpha, t_ps, fit_start_idx, fit_end_idx)
+        if np.isnan(alpha_mean):
+            return "uncertain", np.nan, np.nan, np.nan, "alpha 判定: α 无法计算"
+        if alpha_mean < 0.8:
+            return "subdiffusive", np.nan, alpha_mean, alpha_std, f"alpha 判定: 亚扩散 α={alpha_mean:.2f}"
+        if alpha_mean > 1.2:
+            return "superdiffusive", np.nan, alpha_mean, alpha_std, f"alpha 判定: 超扩散 α={alpha_mean:.2f}"
+        return "credible", np.nan, alpha_mean, alpha_std, f"alpha 判定: 扩散 α={alpha_mean:.2f}±{alpha_std:.2f}"
+
+    raise ValueError(f"Unknown plateau method: {method}")
+
+
 # ==============================================================================
 # 输出与绘图
 # ==============================================================================
@@ -1533,17 +1698,35 @@ def save_msd_data(
 def save_running_D_data(
     filepath: str,
     t_ps: np.ndarray,
-    D_ratio: np.ndarray,
-    D_deriv: np.ndarray
+    D_ratio: Optional[np.ndarray],
+    D_deriv: Optional[np.ndarray],
+    mode: str = 'both'
 ):
     """保存 Running-D 数据"""
+    use_ratio = mode in ('ratio', 'both') and D_ratio is not None
+    use_deriv = mode in ('derivative', 'both') and D_deriv is not None
     with open(filepath, 'w') as f:
         f.write("# Running Diffusion Coefficient\n")
-        f.write("# 单位: t_ps (ps), D_ratio (cm²/s), D_deriv (cm²/s)\n")
-        f.write("# D_ratio = MSD/(6t), D_deriv = (1/6) d(MSD)/dt\n")
-        f.write("# t_ps  D_ratio  D_deriv\n")
-        for t, dr, dd in zip(t_ps[1:], D_ratio[1:], D_deriv[1:]):
-            f.write(f"{t:.6f}  {dr:.6e}  {dd:.6e}\n")
+        if use_ratio and use_deriv:
+            f.write("# 单位: t_ps (ps), D_ratio (cm²/s), D_deriv (cm²/s)\n")
+            f.write("# D_ratio = MSD/(2*d*t), D_deriv = (1/2d) d(MSD)/dt\n")
+            f.write("# t_ps  D_ratio  D_deriv\n")
+            for t, dr, dd in zip(t_ps[1:], D_ratio[1:], D_deriv[1:]):
+                f.write(f"{t:.6f}  {dr:.6e}  {dd:.6e}\n")
+        elif use_ratio:
+            f.write("# 单位: t_ps (ps), D_ratio (cm²/s)\n")
+            f.write("# D_ratio = MSD/(2*d*t)\n")
+            f.write("# t_ps  D_ratio\n")
+            for t, dr in zip(t_ps[1:], D_ratio[1:]):
+                f.write(f"{t:.6f}  {dr:.6e}\n")
+        elif use_deriv:
+            f.write("# 单位: t_ps (ps), D_deriv (cm²/s)\n")
+            f.write("# D_deriv = (1/2d) d(MSD)/dt\n")
+            f.write("# t_ps  D_deriv\n")
+            for t, dd in zip(t_ps[1:], D_deriv[1:]):
+                f.write(f"{t:.6f}  {dd:.6e}\n")
+        else:
+            f.write("# No running-D data requested\n")
 
 
 def save_alpha_data(filepath: str, t_ps: np.ndarray, alpha: np.ndarray):
@@ -1599,13 +1782,14 @@ def plot_msd(
 
 def plot_running_D(
     t_ps: np.ndarray,
-    D_ratio: np.ndarray,
-    D_deriv: np.ndarray,
+    D_ratio: Optional[np.ndarray],
+    D_deriv: Optional[np.ndarray],
     specie: str,
     fit_start_idx: int,
     fit_end_idx: int,
     D_mean: float,
     D_std: float,
+    mode: str = 'both',
     outdir: str = "."
 ):
     """绘制 Running-D 曲线（ratio + derivative）"""
@@ -1614,9 +1798,12 @@ def plot_running_D(
     
     fig, ax = plt.subplots(figsize=(8, 5))
     
-    # 跳过 t=0
-    ax.plot(t_ps[1:], D_ratio[1:], 'b-', linewidth=1, alpha=0.7, label='D_ratio = MSD/(6t)')
-    ax.plot(t_ps[1:], D_deriv[1:], 'g-', linewidth=1, alpha=0.7, label='D_deriv = (1/6)dMSD/dt')
+    use_ratio = mode in ('ratio', 'both') and D_ratio is not None
+    use_deriv = mode in ('derivative', 'both') and D_deriv is not None
+    if use_ratio:
+        ax.plot(t_ps[1:], D_ratio[1:], 'b-', linewidth=1, alpha=0.7, label='D_ratio = MSD/(2*d*t)')
+    if use_deriv:
+        ax.plot(t_ps[1:], D_deriv[1:], 'g-', linewidth=1, alpha=0.7, label='D_deriv = (1/2d) dMSD/dt')
     
     # 平均值线
     ax.axhline(y=D_mean, color='r', linestyle='--', linewidth=2, 
@@ -1698,6 +1885,9 @@ def write_report(
     alpha_mean: float,
     alpha_std: float,
     plateau_msg: str,
+    diff_dim: int,
+    runningD_mode: str,
+    plateau_method: str,
     time_origin_mode: str,
     n_origins: int,
     max_lag_ps: float,
@@ -1728,10 +1918,11 @@ def write_report(
         f.write(f"总帧数: {nframes}\n")
         f.write(f"时间步长: {dt_fs} fs\n")
         f.write(f"总模拟时间: {t_total_ps:.3f} ps\n\n")
+        f.write(f"扩散维度: d={diff_dim} (Einstein denominator=2d)\n\n")
         
         f.write("--- 时间原点配置 ---\n")
         f.write(f"模式: {time_origin_mode}\n")
-        if time_origin_mode == 'multi':
+        if time_origin_mode.startswith('multi'):
             f.write(f"时间原点数: {n_origins}\n")
             f.write(f"最大 lag: {max_lag_ps:.3f} ps\n")
             f.write(f"最小样本数阈值: {min_samples}\n")
@@ -1808,8 +1999,12 @@ def write_report(
         f.write("\n")
         
         f.write("--- 平台判定 ---\n")
+        f.write(f"判定方法: {plateau_method}\n")
         f.write(f"判定等级: {verdict}\n")
-        f.write(f"D_deriv 漂移率: {drift_ratio*100:.1f}%%\n")
+        if np.isnan(drift_ratio):
+            f.write("D_deriv 漂移率: N/A (not used)\n")
+        else:
+            f.write(f"D_deriv 漂移率: {drift_ratio*100:.1f}%%\n")
         if not np.isnan(alpha_mean):
             f.write(f"α 均值: {alpha_mean:.3f} ± {alpha_std:.3f}\n")
             regime, regime_desc = interpret_alpha(alpha_mean, alpha_std)
@@ -1830,10 +2025,20 @@ def write_report(
         
         f.write("\n--- 输出文件 ---\n")
         f.write(f"msd_{specie}.dat: MSD 数据 (t_ps, MSD_A2, n_samples)\n")
-        f.write(f"D_running_{specie}.dat: Running-D 数据 (D_ratio, D_deriv)\n")
+        if runningD_mode == 'both':
+            f.write(f"D_running_{specie}.dat: Running-D 数据 (D_ratio, D_deriv)\n")
+        elif runningD_mode == 'ratio':
+            f.write(f"D_running_{specie}.dat: Running-D 数据 (D_ratio)\n")
+        else:
+            f.write(f"D_running_{specie}.dat: Running-D 数据 (D_deriv)\n")
         f.write(f"alpha_{specie}.dat: log-log 斜率 α(t)\n")
         f.write(f"msd_{specie}.png: MSD 图\n")
-        f.write(f"D_running_{specie}.png: Running-D 图 (ratio + derivative)\n")
+        if runningD_mode == 'both':
+            f.write(f"D_running_{specie}.png: Running-D 图 (ratio + derivative)\n")
+        elif runningD_mode == 'ratio':
+            f.write(f"D_running_{specie}.png: Running-D 图 (ratio)\n")
+        else:
+            f.write(f"D_running_{specie}.png: Running-D 图 (derivative)\n")
         f.write(f"alpha_{specie}.png: α(t) 图\n")
         
         f.write("\n--- 注意事项 ---\n")
@@ -2139,6 +2344,8 @@ def main():
                         help="平台判定方法 (默认: both)")
     parser.add_argument("--alpha_window", type=int, default=21,
                         help="α(t) 滑窗大小 (点数, 默认: 21)")
+    parser.add_argument("--diff_dim", type=int, choices=[1, 2, 3], default=3,
+                        help="扩散维度 d (Einstein 分母 2d, 默认: 3; slab/受限体系可用 2)")
     
     # === v2.1 改进：误差估计 ===
     parser.add_argument("--n_blocks", type=int, default=5,
@@ -2163,6 +2370,8 @@ def main():
                         help="OUTCAR 变胞检测相对标准差阈值 (默认: 0.01)")
     parser.add_argument("--no_cell_angle_check", dest='cell_angle_check', action='store_false',
                         help="变胞检测时不使用晶胞角度波动判据")
+    parser.add_argument("--require_valid_cell_check", action='store_true', default=False,
+                        help="要求 OUTCAR 变胞校验可用；若 cell 状态未知则报错退出")
     parser.add_argument("--min_block_time_ps", type=float, default=5.0,
                         help="Minimum block duration for error estimation (ps, default: 5.0)")
     parser.add_argument("--com_selection", default=None,
@@ -2212,6 +2421,9 @@ def main():
     print(f"MSD 方法: {msd_method}")
     if msd_method == 'mto':
         print(f"stride: {args.stride}")
+    print(f"扩散维度 d: {args.diff_dim}")
+    print(f"Running-D 模式: {args.runningD}")
+    print(f"平台判定方法: {args.plateau_method}")
     print(f"COM 漂移去除: {args.remove_com}")
     print(f"Unwrap 检查: {'启用' if args.unwrap_check else '禁用'}")
     print(f"严格模式: {'启用' if args.strict else '禁用'}")
@@ -2240,7 +2452,54 @@ def main():
         check_angles=args.cell_angle_check
     )
     print(f"    Cell check: {cell_check['message']}")
-    
+
+    if cell_check.get('validation_state') == 'unknown':
+        print("    [WARN] Cell variability status is unknown (OUTCAR unavailable or unparsable)")
+        if args.require_valid_cell_check:
+            summary_line = format_summary_line(
+                status='error',
+                verdict='not_run',
+                D_mean=np.nan,
+                D_std=np.nan,
+                D_sem=np.nan,
+                alpha_mean=np.nan,
+                alpha_std=np.nan,
+                drift_ratio=0.0,
+                fit_start_ps=0.0,
+                fit_end_ps=0.0,
+                skip_ps_used=0.0,
+                stride=args.stride,
+                max_lag_ps=0.0,
+                strict=args.strict,
+                allow_unreliable_D=args.allow_unreliable_D,
+                cell_is_variable=False,
+                cell_validation_state=cell_check.get('validation_state', 'unknown'),
+                cell_rel_std=cell_check['max_rel_std'],
+                cell_rel_std_tol=args.cell_rel_std_tol,
+                duplicate_frames_removed=0,
+                reason='cell_check_unknown',
+            )
+            print("\n" + "!" * 70)
+            print("[ERROR] Cell variability check is unknown and --require_valid_cell_check is set")
+            print(f"[ERROR] {cell_check['message']}")
+            print("!" * 70)
+            write_abort_report(
+                args.specie,
+                args.dt_fs,
+                abort_reason='cell_check_unknown',
+                strict_flags=strict_flags,
+                cell_check={
+                    'tolerance': args.cell_rel_std_tol,
+                    'check_angles': args.cell_angle_check,
+                    'message': cell_check['message'],
+                },
+                summary_line=summary_line,
+                outdir=args.outdir
+            )
+            print(f"    [OK] {os.path.join(args.outdir, 'msd_report.txt')}")
+            print(summary_line)
+            sys.exit(1)
+
     if cell_check['is_variable']:
         summary_line = format_summary_line(
             status='error',
@@ -2259,6 +2518,7 @@ def main():
             strict=args.strict,
             allow_unreliable_D=args.allow_unreliable_D,
             cell_is_variable=cell_check['is_variable'],
+            cell_validation_state=cell_check.get('validation_state', 'unknown'),
             cell_rel_std=cell_check['max_rel_std'],
             cell_rel_std_tol=args.cell_rel_std_tol,
             duplicate_frames_removed=0,
@@ -2400,7 +2660,11 @@ def main():
     if args.com_selection is not None and not uses_selected_reference:
         print("    [WARN] --com_selection is ignored unless remove_com is selected/selected_linear")
     
-    unwrapped, com_drift = remove_com_drift(unwrapped, lattice, args.remove_com, com_indices)
+    try:
+        unwrapped, com_drift = remove_com_drift(unwrapped, lattice, args.remove_com, com_indices)
+    except ValueError as exc:
+        print(f"[ERROR] COM drift removal failed: {exc}")
+        sys.exit(1)
     
     if args.remove_com != 'none':
         print(f"    COM 漂移: {np.linalg.norm(com_drift):.4f} Å")
@@ -2476,10 +2740,22 @@ def main():
 
     # 8. 计算 Running-D
     print("\n>>> 计算 Running-D...")
-    D_ratio = compute_running_D_ratio(t_ps, msd)
-    D_deriv = compute_running_D_derivative(t_ps, msd)
-    print(f"    D_ratio: MSD/(6t)")
-    print(f"    D_deriv: (1/6) d(MSD)/dt")
+    need_ratio_for_output = args.runningD in ('ratio', 'both')
+    need_deriv_for_output = args.runningD in ('derivative', 'both')
+    need_deriv_for_plateau = args.plateau_method in ('D_derivative', 'both')
+    need_ratio = need_ratio_for_output
+    need_deriv = need_deriv_for_output or need_deriv_for_plateau
+
+    D_ratio = compute_running_D_ratio(t_ps, msd, diff_dim=args.diff_dim) if need_ratio else None
+    D_deriv = compute_running_D_derivative(t_ps, msd, diff_dim=args.diff_dim) if need_deriv else None
+    if need_ratio:
+        print(f"    D_ratio: MSD/(2*d*t), d={args.diff_dim}")
+    else:
+        print("    D_ratio: skipped by --runningD")
+    if need_deriv:
+        print(f"    D_deriv: (1/2d) d(MSD)/dt, d={args.diff_dim}")
+    else:
+        print("    D_deriv: skipped by --runningD/--plateau_method")
 
     # 9. 计算 α(t)
     print("\n>>> 计算 log-log 斜率 α(t)...")
@@ -2537,11 +2813,25 @@ def main():
     print(f"    弹道区跳过: {skip_ps_used:.3f} ps")
     print(f"    拟合区间: {fit_start_ps:.3f} ~ {fit_end_ps:.3f} ps")
     print(f"    拟合点数: {fit_end_idx - fit_start_idx}")
+    if args.plateau_method in ('alpha', 'both') and len(t_alpha) > 0:
+        alpha_mask = (t_alpha >= fit_start_ps) & (t_alpha <= fit_end_ps) & (~np.isnan(alpha))
+        n_alpha_fit = int(np.sum(alpha_mask))
+        if n_alpha_fit < 5:
+            print(
+                f"    [WARN] alpha fit-window samples={n_alpha_fit}; "
+                "alpha-based verdict may be noisy"
+            )
 
     # 11. 平台判定
     print("\n>>> 平台判定...")
-    verdict, drift_ratio, alpha_mean, alpha_std, plateau_msg = check_plateau_combined(
-        D_deriv, t_ps, alpha, t_alpha, fit_start_idx, fit_end_idx
+    verdict, drift_ratio, alpha_mean, alpha_std, plateau_msg = check_plateau_by_method(
+        args.plateau_method,
+        D_deriv,
+        t_ps,
+        alpha,
+        t_alpha,
+        fit_start_idx,
+        fit_end_idx
     )
     print(f"    {plateau_msg}")
     
@@ -2568,7 +2858,7 @@ def main():
     t_fit = t_ps[fit_start_idx:fit_end_idx]
     msd_fit = msd[fit_start_idx:fit_end_idx]
     intercept, slope, r2 = linear_fit(t_fit, msd_fit)
-    D_global = slope / 6.0 * 1e-4
+    D_global = slope / (2.0 * float(args.diff_dim)) * 1e-4
     fit_start_ps_used = float(t_ps[min(fit_start_idx, len(t_ps) - 1)])
     fit_end_ps_used = float(t_ps[fit_end_idx - 1]) if fit_end_idx > 0 else float(t_ps[-1])
     
@@ -2584,15 +2874,16 @@ def main():
             skip_ps=skip_ps_used,
             stride=args.stride if msd_method == 'mto' else 1,
             max_lag_frames=max_lag_frames_used,
-            min_samples=args.min_samples
+            min_samples=args.min_samples,
+            diff_dim=args.diff_dim
         )
         
         # v2.2: NaN check (blocks too short returns NaN)
         if np.isnan(D_mean) or len(D_blocks) == 0:
-            print("    [WARN] Block 方法失败，回退到全局拟合")
+            print("    [WARN] Block 方法失败，回退到全局拟合 D；不确定度设为 NaN")
             D_mean = D_global
-            D_std = 0.0
-            D_sem = 0.0
+            D_std = np.nan
+            D_sem = np.nan
         else:
             print(f"    有效 blocks: {len(D_blocks)}")
     else:
@@ -2601,7 +2892,7 @@ def main():
             origins = select_time_origins(
                 nframes, args.n_origins, args.origin_stride, max_lag_frames_used
             )
-            D_mean, D_std, D_ci_low, D_ci_high = estimate_D_with_bootstrap(
+            D_mean, D_std, D_ci_low, D_ci_high, n_boot_valid = estimate_D_with_bootstrap(
                 unwrapped,
                 lattice,
                 indices,
@@ -2612,21 +2903,23 @@ def main():
                 fit_end_idx,
                 args.n_bootstrap,
                 args.seed,
-                min_samples=args.min_samples
+                min_samples=args.min_samples,
+                diff_dim=args.diff_dim
             )
             if np.isnan(D_mean):
-                print("    [WARN] Bootstrap 有效重采样不足，回退到全局拟合")
+                print("    [WARN] Bootstrap 有效重采样不足，回退到全局拟合 D；不确定度设为 NaN")
                 D_mean = D_global
-                D_std = 0.0
-                D_sem = 0.0
+                D_std = np.nan
+                D_sem = np.nan
             else:
-                D_sem = D_std / np.sqrt(args.n_bootstrap)
+                D_sem = D_std / np.sqrt(n_boot_valid)
+                print(f"    有效 bootstrap 样本: {n_boot_valid}/{args.n_bootstrap}")
                 print(f"    95%% CI: [{D_ci_low:.6e}, {D_ci_high:.6e}] cm²/s")
         else:
-            print("    [WARN] Bootstrap 需要 MTO 模式，回退到全局拟合")
+            print("    [WARN] Bootstrap 需要 MTO 模式，回退到全局拟合 D；不确定度设为 NaN")
             D_mean = D_global
-            D_std = 0.0
-            D_sem = 0.0
+            D_std = np.nan
+            D_sem = np.nan
 
     # 13. 保存数据
     print("\n>>> 保存数据...")
@@ -2638,7 +2931,7 @@ def main():
     
     # Running-D 数据
     D_path = os.path.join(args.outdir, f"D_running_{args.specie}.dat")
-    save_running_D_data(D_path, t_ps, D_ratio, D_deriv)
+    save_running_D_data(D_path, t_ps, D_ratio, D_deriv, mode=args.runningD)
     print(f"    [OK] {D_path}")
     
     # Alpha 数据
@@ -2650,7 +2943,10 @@ def main():
     # 14. 绘图
     print("\n>>> 绘图...")
     plot_msd(t_ps, msd, args.specie, fit_start_idx, fit_end_idx, slope, intercept, args.outdir)
-    plot_running_D(t_ps, D_ratio, D_deriv, args.specie, fit_start_idx, fit_end_idx, D_mean, D_std, args.outdir)
+    plot_running_D(
+        t_ps, D_ratio, D_deriv, args.specie, fit_start_idx, fit_end_idx,
+        D_mean, D_std, mode=args.runningD, outdir=args.outdir
+    )
     plot_alpha(t_alpha, alpha, args.specie, fit_start_ps, fit_end_ps, args.outdir)
     
     if HAS_MPL:
@@ -2666,17 +2962,22 @@ def main():
     
     # 确定时间原点模式名称
     time_origin_mode_str = 'multi (MTO)' if msd_method == 'mto' else 'single (t0=0)'
-    is_subdiffusive = verdict in ['subdiffusive', 'unreliable']
+    is_subdiffusive_like = (
+        args.plateau_method in ('alpha', 'both')
+        and np.isfinite(alpha_mean)
+        and alpha_mean < 0.8
+    )
     is_strict = args.strict and not args.allow_unreliable_D
-    summary_D_mean = np.nan if (is_subdiffusive and is_strict) else D_mean
-    summary_D_std = np.nan if (is_subdiffusive and is_strict) else D_std
-    summary_D_sem = np.nan if (is_subdiffusive and is_strict) else D_sem
+    strict_invalidates_D = bool(is_subdiffusive_like and is_strict)
+    report_D_mean = np.nan if strict_invalidates_D else D_mean
+    report_D_std = np.nan if strict_invalidates_D else D_std
+    report_D_sem = np.nan if strict_invalidates_D else D_sem
     summary_line = format_summary_line(
         status='ok',
         verdict=verdict,
-        D_mean=summary_D_mean,
-        D_std=summary_D_std,
-        D_sem=summary_D_sem,
+        D_mean=report_D_mean,
+        D_std=report_D_std,
+        D_sem=report_D_sem,
         alpha_mean=alpha_mean,
         alpha_std=alpha_std,
         drift_ratio=drift_ratio,
@@ -2688,6 +2989,7 @@ def main():
         strict=args.strict,
         allow_unreliable_D=args.allow_unreliable_D,
         cell_is_variable=cell_check['is_variable'],
+        cell_validation_state=cell_check.get('validation_state', 'unknown'),
         cell_rel_std=cell_check['max_rel_std'],
         cell_rel_std_tol=args.cell_rel_std_tol,
         duplicate_frames_removed=duplicate_summary['count'],
@@ -2696,8 +2998,9 @@ def main():
     write_report(
         args.specie, nframes, args.dt_fs, t_total_ps,
         fit_start_ps, fit_end_ps,
-        D_mean, D_std, D_sem, r2,
+        report_D_mean, report_D_std, report_D_sem, r2,
         verdict, drift_ratio, alpha_mean, alpha_std, plateau_msg,
+        args.diff_dim, args.runningD, args.plateau_method,
         time_origin_mode_str, n_origins_used, max_lag_ps_used, args.min_samples,
         args.remove_com, com_drift,
         args.block_mode, args.n_blocks,
@@ -2729,11 +3032,11 @@ def main():
     print(f"拟合 R²: {r2:.6f}")
     print("-" * 70)
     
-    if is_subdiffusive and is_strict:
+    if strict_invalidates_D:
         print(f"扩散系数 D = NaN (D_UNDEFINED: α<0.8 subdiffusive regime)")
         print(f"           [STRICT MODE] D is not well-defined for subdiffusive motion")
     else:
-        if is_subdiffusive:
+        if verdict in ['subdiffusive', 'unreliable', 'drifting', 'uncertain', 'superdiffusive']:
             print(f"扩散系数 D = ({D_mean:.4e} ± {D_std:.4e}) cm²/s (±STD) [UNRELIABLE]")
             print(f"           = ({D_mean:.4e} ± {D_sem:.4e}) cm²/s (±SEM) [UNRELIABLE]")
         else:
@@ -2742,7 +3045,10 @@ def main():
     
     print("-" * 70)
     print(f"平台判定: {verdict}")
-    print(f"D_deriv 漂移率: {drift_ratio*100:.1f}%%")
+    if np.isnan(drift_ratio):
+        print("D_deriv 漂移率: N/A (not used)")
+    else:
+        print(f"D_deriv 漂移率: {drift_ratio*100:.1f}%%")
     if not np.isnan(alpha_mean):
         print(f"α (拟合区间): {alpha_mean:.3f} ± {alpha_std:.3f}")
         regime, regime_desc = interpret_alpha(alpha_mean, alpha_std)
@@ -2755,8 +3061,8 @@ def main():
         print("\n[WARN] 扩散系数可能不可靠，请检查报告详情！")
         print("[INFO] 建议: 延长 AIMD 模拟时间 / 检查体系平衡状态")
     
-    # v2.2: Exit code logic for subdiffusion guardrail
-    if is_subdiffusive and is_strict:
+    # Exit code 2 is reserved for subdiffusion-like strict failure.
+    if strict_invalidates_D:
         print("\n" + "!" * 70)
         print("[STRICT MODE] Exiting with code 2: D is undefined under subdiffusion")
         print("[STRICT MODE] To output D anyway, use: --allow_unreliable_D")
