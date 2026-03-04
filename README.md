@@ -137,11 +137,12 @@ source ~/vasp_scripts/vasp_env.sh
 
 ### 功能
 
-- ✅ WSL 核数检查（自动下调或报错）
+- ✅ 核数检查（仅 WSL 应用 `RESERVE_CORES` 预留；非 WSL 不预留）
 - ✅ 磁盘空间预检查（POSIX 兼容）
 - ✅ AIMD 续算支持（CONTCAR → POSCAR + 轨迹合并）
-- ✅ stdout/stderr 分离输出（支持 stdbuf 行缓冲）
+- ✅ stdout/stderr 分离输出（支持 stdbuf 行缓冲，崩溃场景显式等待日志落盘）
 - ✅ mpirun 返回码可靠捕获（管道过滤不影响真实退出码）
+- ✅ 完成判定绑定本轮 OUTCAR 片段（避免旧完成标记误判）
 - ✅ 运行耗时统计
 - ✅ 自动备份输入文件
 - ✅ 条件化归档旧输出文件（保护续算用文件）
@@ -149,6 +150,7 @@ source ~/vasp_scripts/vasp_env.sh
 - ✅ **v2.0** 重启文件守卫（ISTART/ICHARG 验证）
 - ✅ **v2.0** HPC 线程保护（防止 MKL/OMP 过载）
 - ✅ **v2.0** XDATCAR 轨迹合并（aimd_msd.py 连续性）
+- ✅ **v2.0** XDATCAR 合并仅在“本轮被接受”后执行（失败/未完成不合并）
 - ✅ **v2.0** RESUME 日志轮转保护（OUTCAR/OSZICAR 防无限增长）
 
 ### 用法
@@ -189,7 +191,7 @@ RESUME=1 KEEP_APPEND_LOGS=1 NP=16 run_vasp.sh
 | `ERR` | vasp.err | stderr 文件 |
 | `RESUME` | 0 | 续算模式：1=自动 cp CONTCAR→POSCAR |
 | `STRICT_NP` | 0 | 严格核数：1=超限报错，0=自动下调 |
-| `RESERVE_CORES` | 2 | WSL 预留核数 |
+| `RESERVE_CORES` | 2 | WSL 预留核数（仅 WSL 生效） |
 | `MIN_FREE_GB` | 20 | 最小磁盘空间 (GB) |
 | `FORCE_DISK` | 0 | 忽略磁盘检查（默认启用检查） |
 
@@ -198,7 +200,7 @@ RESUME=1 KEEP_APPEND_LOGS=1 NP=16 run_vasp.sh
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `KEEP_RESTART` | auto | 保留 WAVECAR/CHGCAR/CHG：RESUME=1 时默认 1，否则 0 |
-| `KEEP_TRAJECTORY` | auto | 保留 XDATCAR：RESUME=1 时默认 1，否则 0 |
+| `KEEP_TRAJECTORY` | auto | 保留 XDATCAR：仅在有效续算语义下生效（RESUME=1 且 CONTCAR 校验通过） |
 | `FORCE_RESTART` | 0 | 跳过 WAVECAR/CHGCAR 存在性检查（强制运行） |
 | `THREAD_GUARD` | 1 | 线程保护：1=强制 OMP/MKL 线程限制，防止 HPC 过载 |
 | `STRICT_INPUT` | 0 | 严格输入：1=KPOINTS/KSPACING 缺失时报错退出 |
@@ -217,15 +219,23 @@ RESUME=1 KEEP_APPEND_LOGS=1 NP=16 run_vasp.sh
 **续算保护机制**：
 - 如果 INCAR 中 `ISTART ≥ 1` 但 WAVECAR 不存在 → 脚本中止
 - 如果 INCAR 中 `ICHARG = 1` 但 CHGCAR 不存在 → 脚本中止
+- `RESUME=1` 时会严格校验 CONTCAR（晶格/原子计数/坐标块完整性）；可疑或截断文件会直接中止
 - 设置 `FORCE_RESTART=1` 可跳过检查（强制从头计算）
 
 **XDATCAR 轨迹合并**：
-- RESUME=1 时自动备份 XDATCAR → XDATCAR.prev
+- 仅在“有效续算”下备份旧 XDATCAR（`RESUME=1` 且 `CONTCAR -> POSCAR` 校验通过）
+- `KEEP_TRAJECTORY=1` 但非有效续算时，会自动禁用轨迹保留并归档旧 XDATCAR，避免跨任务误拼接
 - 从 POSCAR 计算 `NATOMS`，提取 `XDATCAR.prev` 最后一帧与新 XDATCAR 第一帧
 - 若两帧坐标（去空白后）完全相同，则跳过新 XDATCAR 的第一帧再追加，避免重复 frame 0
 - 若帧解析失败，则回退为 header-skip 追加，并在 `run.log` 写入 `WARNING`
 - `Direct configuration=` 检测支持前导空白
+- **仅当本轮被接受**（`mpirun rc=0` 且本轮 OUTCAR 片段检测到完成标志）才执行合并
+- 本轮失败/未完成时会跳过合并，防止污染历史轨迹
 - 保证 `aimd_msd.py` 可处理完整轨迹
+
+**完成判定（RESUME 关键）**：
+- 完成检查仅扫描本轮新增 OUTCAR 片段，不会被旧追加段的完成标志“误判成功”
+- `mpirun` 非零返回码不会出现最终 `[OK]` 完成提示
 
 **RESUME 日志轮转（OUTCAR/OSZICAR）**：
 - 默认 `RESUME=1` 时按 `LOG_ROTATE_GB`（默认 2 GB）检查 OUTCAR/OSZICAR
@@ -1463,6 +1473,7 @@ NP=32 run_vasp.sh
 # 严格模式（报错退出）
 STRICT_NP=1 NP=32 run_vasp.sh
 ```
+说明：`RESERVE_CORES` 仅在 WSL 下生效；非 WSL 仅按 `nproc` 上限检查。
 
 **Q: 如何续算 AIMD？**
 ```bash
@@ -1494,6 +1505,8 @@ FORCE_RESTART=1 run_vasp.sh
 - 对比 `XDATCAR.prev` 最后一帧与新 XDATCAR 第一帧
 - 重复时跳过新文件第一帧，避免零速度假段
 - 解析失败时在 `run.log` 写 `WARNING` 并回退到 header-skip 合并
+- 仅在本轮被接受（`mpirun rc=0` + 本轮 OUTCAR 完成标志）时才合并
+- 本轮失败/未完成会跳过合并，避免污染旧轨迹
 
 必要时可手动合并：
 ```bash

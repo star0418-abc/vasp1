@@ -25,7 +25,35 @@
 #   KEEP_APPEND_LOGS - RESUME 时保留 OUTCAR/OSZICAR 追加: 1=保留不轮转 (默认 0)
 #   LOG_ROTATE_GB    - RESUME 时 OUTCAR/OSZICAR 轮转阈值 GB (默认 2)
 # ============================================================================
-set -uo pipefail  # 不用 -e，手动捕获 mpirun 返回码
+set -uo pipefail  # 使用显式返回码判断，避免 set -e 隐式中断控制流
+
+TMP_PATHS=()
+register_tmp_path() {
+    local path="$1"
+    [[ -n "$path" ]] || return 0
+    TMP_PATHS+=("$path")
+}
+cleanup_tmp_paths() {
+    local path
+    for path in "${TMP_PATHS[@]-}"; do
+        [[ -n "$path" ]] || continue
+        if [[ -d "$path" ]]; then
+            rm -rf -- "$path" 2>/dev/null || true
+        else
+            rm -f -- "$path" 2>/dev/null || true
+        fi
+    done
+}
+handle_signal() {
+    local sig="$1"
+    local code="$2"
+    echo "[ABORT] 收到 $sig，清理临时文件后退出。" >&2
+    cleanup_tmp_paths
+    exit "$code"
+}
+trap cleanup_tmp_paths EXIT
+trap 'handle_signal INT 130' INT
+trap 'handle_signal TERM 143' TERM
 
 # ---------------------- 加载 VASP 环境 ----------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -69,6 +97,14 @@ if ! [[ "$LOG_ROTATE_GB" =~ ^[1-9][0-9]*$ ]]; then
     LOG_ROTATE_GB=2
 fi
 LOG_ROTATE_BYTES=$((LOG_ROTATE_GB * 1024 * 1024 * 1024))
+RESUME_CONTINUATION_READY=0
+
+TMP_ROOT=$(mktemp -d "/tmp/run_vasp.${TIMESTAMP}.XXXXXX" 2>/dev/null || true)
+if [[ -z "$TMP_ROOT" || ! -d "$TMP_ROOT" ]]; then
+    echo "[ERROR] 无法创建临时目录用于日志/轨迹保护"
+    exit 1
+fi
+register_tmp_path "$TMP_ROOT"
 
 is_wsl() {
     grep -qiE "(microsoft|wsl)" /proc/version /proc/sys/kernel/osrelease 2>/dev/null
@@ -95,6 +131,7 @@ if [[ -z "$KEEP_TRAJECTORY" ]]; then
         KEEP_TRAJECTORY=0
     fi
 fi
+KEEP_TRAJECTORY_EFFECTIVE="$KEEP_TRAJECTORY"
 
 # ---------------------- 函数：解析 INCAR 整数参数 ----------------------
 # 支持行内多参数（; 分隔），忽略 #/! 注释，同名参数取最后一次出现
@@ -185,6 +222,7 @@ get_poscar_natoms() {
     local poscar_file="${1:-POSCAR}"
     [[ -f "$poscar_file" ]] || return 1
     awk '
+        { gsub(/\r/, "", $0) }
         function sum_if_int_fields(   i,sum) {
             if (NF < 1) return -1
             sum = 0
@@ -211,12 +249,140 @@ get_poscar_natoms() {
     ' "$poscar_file"
 }
 
+validate_contcar_for_resume() {
+    local contcar_file="${1:-CONTCAR}"
+    local expected_natoms="${2:-}"
+    [[ -f "$contcar_file" ]] || return 1
+    awk -v expected="$expected_natoms" '
+        function trim(s) {
+            sub(/^[[:space:]]+/, "", s)
+            sub(/[[:space:]]+$/, "", s)
+            return s
+        }
+        function split_fields(line, arr,    txt) {
+            txt = line
+            gsub(/\r/, "", txt)
+            txt = trim(txt)
+            if (txt == "") return 0
+            return split(txt, arr, /[[:space:]]+/)
+        }
+        function is_int_line(line,    arr,n,i) {
+            n = split_fields(line, arr)
+            if (n < 1) return 0
+            for (i = 1; i <= n; i++) {
+                if (arr[i] !~ /^[0-9]+$/) return 0
+            }
+            return 1
+        }
+        function sum_int_line(line,    arr,n,i,sum) {
+            n = split_fields(line, arr)
+            sum = 0
+            for (i = 1; i <= n; i++) sum += arr[i]
+            return sum
+        }
+        function is_number(x) {
+            return (x ~ /^[-+]?([0-9]+([.][0-9]*)?|[.][0-9]+)([Ee][-+]?[0-9]+)?$/)
+        }
+        BEGIN { nline = 0 }
+        {
+            raw[++nline] = $0
+            gsub(/\r/, "", raw[nline])
+        }
+        END {
+            if (nline < 8) {
+                print "CONTCAR 行数过少(" nline ")，至少需要 8 行"
+                exit 1
+            }
+
+            split_fields(raw[2], scale)
+            if (scale[1] == "" || !is_number(scale[1])) {
+                print "CONTCAR 第 2 行缩放因子非法"
+                exit 1
+            }
+
+            for (i = 3; i <= 5; i++) {
+                nf = split_fields(raw[i], vec)
+                if (nf < 3 || !is_number(vec[1]) || !is_number(vec[2]) || !is_number(vec[3])) {
+                    print "CONTCAR 晶格向量非法(第 " i " 行)"
+                    exit 1
+                }
+            }
+
+            counts_line = 0
+            if (is_int_line(raw[6])) {
+                counts_line = 6
+            } else if (is_int_line(raw[7])) {
+                counts_line = 7
+            } else {
+                print "CONTCAR 第 6/7 行均不是有效原子计数行"
+                exit 1
+            }
+
+            natoms = sum_int_line(raw[counts_line])
+            if (natoms <= 0) {
+                print "CONTCAR 原子总数非法: " natoms
+                exit 1
+            }
+
+            coord_line = counts_line + 1
+            mode = trim(raw[coord_line])
+            low = tolower(mode)
+            if (low ~ /^selective([[:space:]]+dynamics)?$/) {
+                coord_line++
+                mode = trim(raw[coord_line])
+                low = tolower(mode)
+            }
+            if (low !~ /^(direct|cartesian)([[:space:]]|$)/) {
+                print "CONTCAR 缺少 Direct/Cartesian 坐标模式行"
+                exit 1
+            }
+
+            first_coord = coord_line + 1
+            last_coord = first_coord + natoms - 1
+            if (last_coord > nline) {
+                print "CONTCAR 坐标块不完整: 需要 " natoms " 行，实际仅 " (nline - first_coord + 1) " 行"
+                exit 1
+            }
+
+            for (i = first_coord; i <= last_coord; i++) {
+                nf = split_fields(raw[i], c)
+                if (nf < 3 || !is_number(c[1]) || !is_number(c[2]) || !is_number(c[3])) {
+                    print "CONTCAR 坐标行非法(第 " i " 行)"
+                    exit 1
+                }
+            }
+
+            if (expected ~ /^[0-9]+$/ && expected + 0 != natoms) {
+                print "CONTCAR 原子总数(" natoms ")与 POSCAR(" expected ")不一致"
+                exit 1
+            }
+
+            print natoms
+        }
+    ' "$contcar_file"
+}
+
+outcar_has_completion_marker_since() {
+    local outcar_file="$1"
+    local start_line="$2"
+    [[ -f "$outcar_file" ]] || return 1
+    if ! [[ "$start_line" =~ ^[0-9]+$ ]] || [[ "$start_line" -lt 1 ]]; then
+        start_line=1
+    fi
+    awk -v from_line="$start_line" '
+        NR < from_line { next }
+        /General timing and accounting informations for this job/ { found = 1; exit 0 }
+        END { exit(found ? 0 : 1) }
+    ' "$outcar_file"
+}
+
 extract_xdatcar_first_frame() {
     local xdatcar_file="$1"
     local natoms="$2"
     awk -v natoms="$natoms" '
         BEGIN { found = 0 }
         function norm_line(line,    i,n,out,f) {
+            gsub(/\r/, "", line)
             n = split(line, f, /[[:space:]]+/)
             out = ""
             for (i = 1; i <= n; i++) {
@@ -243,50 +409,83 @@ extract_xdatcar_first_frame() {
 extract_xdatcar_last_frame() {
     local xdatcar_file="$1"
     local natoms="$2"
-    awk -v natoms="$natoms" '
-        function norm_line(line,    i,n,out,f) {
-            n = split(line, f, /[[:space:]]+/)
-            out = ""
-            for (i = 1; i <= n; i++) {
-                if (f[i] == "") continue
-                if (out != "") out = out " "
-                out = out f[i]
+    local total_lines chunk
+    total_lines=$(wc -l < "$xdatcar_file" 2>/dev/null || echo 0)
+    if ! [[ "$total_lines" =~ ^[0-9]+$ ]] || [[ "$total_lines" -le 0 ]]; then
+        return 1
+    fi
+
+    chunk=$((natoms + 64))
+    if [[ "$chunk" -lt $((natoms + 1)) ]]; then
+        chunk=$((natoms + 1))
+    fi
+    if [[ "$chunk" -gt "$total_lines" ]]; then
+        chunk="$total_lines"
+    fi
+
+    while [[ "$chunk" -le "$total_lines" ]]; do
+        if tail -n "$chunk" "$xdatcar_file" | awk -v natoms="$natoms" '
+            function norm_line(line,    i,n,out,f) {
+                gsub(/\r/, "", line)
+                n = split(line, f, /[[:space:]]+/)
+                out = ""
+                for (i = 1; i <= n; i++) {
+                    if (f[i] == "") continue
+                    if (out != "") out = out " "
+                    out = out f[i]
+                }
+                return out
             }
-            return out
-        }
-        BEGIN {
-            in_frame = 0
-            count = 0
-            block = ""
-            last = ""
-        }
-        /^[[:space:]]*Direct[[:space:]]+configuration[[:space:]]*=/ {
-            in_frame = 1
-            count = 0
-            block = ""
-            next
-        }
-        in_frame {
-            count++
-            block = block norm_line($0) "\n"
-            if (count == natoms) {
-                last = block
+            BEGIN {
                 in_frame = 0
+                count = 0
+                block = ""
+                last = ""
             }
-        }
-        END {
-            if (last == "") exit 1
-            printf "%s", last
-        }
-    ' "$xdatcar_file"
+            /^[[:space:]]*Direct[[:space:]]+configuration[[:space:]]*=/ {
+                in_frame = 1
+                count = 0
+                block = ""
+                next
+            }
+            in_frame {
+                count++
+                block = block norm_line($0) "\n"
+                if (count == natoms) {
+                    last = block
+                    in_frame = 0
+                }
+            }
+            END {
+                if (last == "") exit 1
+                printf "%s", last
+            }
+        '; then
+            return 0
+        fi
+
+        if [[ "$chunk" -eq "$total_lines" ]]; then
+            break
+        fi
+        chunk=$((chunk * 2))
+        if [[ "$chunk" -gt "$total_lines" ]]; then
+            chunk="$total_lines"
+        fi
+    done
+
+    return 1
 }
 
 # ---------------------- 函数：检查 stdbuf 可用性 ----------------------
 check_stdbuf() {
-    if command -v stdbuf &>/dev/null; then
-        echo "stdbuf -oL -eL"
+    command -v stdbuf &>/dev/null
+}
+
+run_with_stdbuf() {
+    if [[ ${#STDBUF_CMD[@]} -gt 0 ]]; then
+        "${STDBUF_CMD[@]}" "$@"
     else
-        echo ""
+        "$@"
     fi
 }
 
@@ -339,16 +538,20 @@ if [[ ! -x "$VASP_BIN/$EXE" ]]; then
 fi
 echo "[OK] 可执行文件: $VASP_BIN/$EXE"
 
-# ---------------------- WSL 核数检查 ----------------------
+# ---------------------- 核数检查 ----------------------
 echo ""
-echo ">>> WSL 核数检查..."
+echo ">>> 核数检查..."
 TOTAL_CORES=$(nproc 2>/dev/null || echo 8)
-MAX_NP=$((TOTAL_CORES - RESERVE_CORES))
-if [[ $MAX_NP -lt 1 ]]; then
-    MAX_NP=1
+if [[ $IS_WSL -eq 1 ]]; then
+    MAX_NP=$((TOTAL_CORES - RESERVE_CORES))
+    if [[ $MAX_NP -lt 1 ]]; then
+        MAX_NP=1
+    fi
+    echo "    [WSL] 总核数: $TOTAL_CORES, 预留: $RESERVE_CORES, 可用: $MAX_NP"
+else
+    MAX_NP=$TOTAL_CORES
+    echo "    [非 WSL] 总核数: $TOTAL_CORES, 不应用 RESERVE_CORES 预留"
 fi
-
-echo "    总核数: $TOTAL_CORES, 预留: $RESERVE_CORES, 可用: $MAX_NP"
 
 if [[ $NP -gt $MAX_NP ]]; then
     if [[ $STRICT_NP -eq 1 ]]; then
@@ -466,36 +669,56 @@ echo ">>> 续算检查..."
 
 if [[ -f CONTCAR ]]; then
     contcar_size=$(stat -c%s CONTCAR 2>/dev/null || echo 0)
-    if [[ $contcar_size -gt 100 ]]; then
-        if [[ $RESUME -eq 1 ]]; then
-            # CONTCAR 验证：检查是否包含 Direct 或 Cartesian
-            if ! grep -qE "^[[:space:]]*(Direct|Cartesian)" CONTCAR 2>/dev/null; then
-                echo "[ERROR] CONTCAR 缺少 Direct/Cartesian 行，文件可能已损坏"
-                echo "[ERROR] 拒绝使用损坏的 CONTCAR 覆盖 POSCAR"
-                exit 1
-            fi
-            
-            echo "[RESUME] 检测到 CONTCAR，启用续算模式"
-            echo "[RESUME] 备份 POSCAR -> POSCAR.bak.$TIMESTAMP"
-            cp POSCAR "POSCAR.bak.$TIMESTAMP"
-            echo "[RESUME] 复制 CONTCAR -> POSCAR"
-            cp CONTCAR POSCAR
-            echo "[OK] 续算准备完成"
-        else
-            echo "[INFO] 检测到 CONTCAR，如需续算请使用: RESUME=1 run_vasp.sh"
+    if [[ $RESUME -eq 1 ]]; then
+        if [[ $contcar_size -le 0 ]]; then
+            echo "[ERROR] CONTCAR 为空，拒绝覆盖 POSCAR"
+            exit 1
         fi
+
+        poscar_natoms_before=$(get_poscar_natoms POSCAR || true)
+        contcar_check_msg=$(validate_contcar_for_resume CONTCAR "$poscar_natoms_before" 2>&1)
+        if [[ $? -ne 0 ]]; then
+            echo "[ERROR] CONTCAR 校验失败: $contcar_check_msg"
+            echo "[ERROR] 拒绝使用可疑 CONTCAR 覆盖 POSCAR"
+            exit 1
+        fi
+
+        echo "[RESUME] 检测到 CONTCAR，启用续算模式 (NATOMS=$contcar_check_msg)"
+        echo "[RESUME] 备份 POSCAR -> POSCAR.bak.$TIMESTAMP"
+        cp POSCAR "POSCAR.bak.$TIMESTAMP"
+        echo "[RESUME] 复制 CONTCAR -> POSCAR"
+        cp CONTCAR POSCAR
+        RESUME_CONTINUATION_READY=1
+        echo "[OK] 续算准备完成"
+    elif [[ $contcar_size -gt 0 ]]; then
+        echo "[INFO] 检测到 CONTCAR，如需续算请使用: RESUME=1 run_vasp.sh"
+    else
+        echo "[INFO] 检测到空 CONTCAR，未自动使用"
     fi
 else
-    echo "[INFO] 无 CONTCAR，非续算"
+    if [[ $RESUME -eq 1 ]]; then
+        echo "[WARN] RESUME=1 但无 CONTCAR，跳过 CONTCAR->POSCAR；本轮不视为轨迹续算"
+    else
+        echo "[INFO] 无 CONTCAR，非续算"
+    fi
 fi
 
 # ---------------------- XDATCAR 轨迹保护 (续算时合并) ----------------------
 XDATCAR_PREV=""
-if [[ $KEEP_TRAJECTORY -eq 1 && -f XDATCAR && -s XDATCAR ]]; then
-    echo "[TRAJECTORY] 保留 XDATCAR 以确保轨迹连续"
-    XDATCAR_PREV="XDATCAR.prev.$TIMESTAMP"
-    cp XDATCAR "$XDATCAR_PREV"
-    echo "[TRAJECTORY] 备份: XDATCAR -> $XDATCAR_PREV"
+if [[ $KEEP_TRAJECTORY -eq 1 ]]; then
+    if [[ $RESUME_CONTINUATION_READY -eq 1 ]]; then
+        if [[ -f XDATCAR && -s XDATCAR ]]; then
+            echo "[TRAJECTORY] 保留 XDATCAR 以确保轨迹连续"
+            XDATCAR_PREV="XDATCAR.prev.$TIMESTAMP"
+            cp XDATCAR "$XDATCAR_PREV"
+            echo "[TRAJECTORY] 备份: XDATCAR -> $XDATCAR_PREV"
+        else
+            echo "[TRAJECTORY] 未检测到可用旧 XDATCAR，跳过备份"
+        fi
+    else
+        KEEP_TRAJECTORY_EFFECTIVE=0
+        echo "[WARN] KEEP_TRAJECTORY=1 但当前不是有效续算，已禁用轨迹保留以避免跨任务拼接"
+    fi
 fi
 
 # ---------------------- RESUME 日志轮转保护 ----------------------
@@ -525,11 +748,12 @@ echo "[OK] 输入文件已备份到: $SNAPSHOT_DIR/"
 echo ""
 echo ">>> 移动旧输出文件..."
 
-# 根据 KEEP_RESTART 和 KEEP_TRAJECTORY 决定哪些文件不移动
+# 根据 KEEP_RESTART 和 KEEP_TRAJECTORY_EFFECTIVE 决定哪些文件不移动
 RESTART_FILES=(WAVECAR CHGCAR CHG)
 TRAJECTORY_FILES=(XDATCAR)
 APPEND_FILES=(OUTCAR OSZICAR)  # VASP 可能追加的文件
 OTHER_FILES=(CONTCAR vasprun.xml "$OUT" "$ERR")
+# 注：RESUME=1 时 CONTCAR 已用于更新 POSCAR；此处归档旧 CONTCAR 以保留审计痕迹
 
 moved_count=0
 
@@ -558,9 +782,12 @@ else
 fi
 
 # 处理轨迹文件
-if [[ $KEEP_TRAJECTORY -eq 1 ]]; then
+if [[ $KEEP_TRAJECTORY_EFFECTIVE -eq 1 ]]; then
     echo "    [KEEP_TRAJECTORY=1] 保留 XDATCAR（已备份到 .prev）"
 else
+    if [[ $KEEP_TRAJECTORY -eq 1 ]]; then
+        echo "    [KEEP_TRAJECTORY=1] 非续算场景禁用保留，避免误拼接旧轨迹"
+    fi
     for f in "${TRAJECTORY_FILES[@]}"; do
         move_old_file "$f"
     done
@@ -630,14 +857,16 @@ echo ">>> 记录运行日志..."
     echo "EXE: $EXE"
     echo "OUT: $OUT"
     echo "ERR: $ERR"
-    echo "RESUME: $RESUME"
-    echo "KEEP_RESTART: $KEEP_RESTART"
-    echo "KEEP_TRAJECTORY: $KEEP_TRAJECTORY"
-    echo "KEEP_APPEND_LOGS: $KEEP_APPEND_LOGS"
-    echo "LOG_ROTATE_GB: $LOG_ROTATE_GB"
-    echo "THREAD_GUARD: $THREAD_GUARD"
-    echo "FORCE_OMP_BIND: $FORCE_OMP_BIND"
-    echo "IS_WSL: $IS_WSL"
+	echo "RESUME: $RESUME"
+	echo "KEEP_RESTART: $KEEP_RESTART"
+	echo "KEEP_TRAJECTORY: $KEEP_TRAJECTORY"
+	echo "KEEP_TRAJECTORY_EFFECTIVE: $KEEP_TRAJECTORY_EFFECTIVE"
+	echo "KEEP_APPEND_LOGS: $KEEP_APPEND_LOGS"
+	echo "LOG_ROTATE_GB: $LOG_ROTATE_GB"
+	echo "RESUME_CONTINUATION_READY: $RESUME_CONTINUATION_READY"
+	echo "THREAD_GUARD: $THREAD_GUARD"
+	echo "FORCE_OMP_BIND: $FORCE_OMP_BIND"
+	echo "IS_WSL: $IS_WSL"
     echo "OMP_NUM_THREADS: ${OMP_NUM_THREADS:-unset}"
     echo "MKL_NUM_THREADS: ${MKL_NUM_THREADS:-unset}"
     echo "ISTART: ${ISTART:-未设置}"
@@ -651,8 +880,9 @@ echo ">>> 记录运行日志..."
 echo "[OK] 运行参数已记录到 run.log"
 
 # ---------------------- 检查 stdbuf ----------------------
-STDBUF=$(check_stdbuf)
-if [[ -n "$STDBUF" ]]; then
+STDBUF_CMD=()
+if check_stdbuf; then
+    STDBUF_CMD=(stdbuf -oL -eL)
     echo "[OK] stdbuf 可用，启用行缓冲"
 else
     echo "[WARN] stdbuf 不可用，tail -f 可能延迟"
@@ -676,41 +906,40 @@ echo ""
 # 记录开始时间
 START_TIME=$(date +%s)
 echo "开始时间: $(date '+%Y-%m-%d %H:%M:%S')" >> run.log
+OUTCAR_BASE_LINES=0
+if [[ -f OUTCAR ]]; then
+    OUTCAR_BASE_LINES=$(wc -l < OUTCAR 2>/dev/null || echo 0)
+fi
+OUTCAR_CHECK_START=$((OUTCAR_BASE_LINES + 1))
+echo "本轮 OUTCAR 检查起始行: $OUTCAR_CHECK_START" >> run.log
 
 # ---------------------- 运行 mpirun (分离 stdout/stderr) ----------------------
-set +e
-
-# 创建临时返回码文件，用于跨分支统一读取 mpirun 返回码
-MPIRUN_RC_FILE="/tmp/mpirun_rc_$$"
-
-if [[ -n "$STDBUF" ]]; then
-    # 使用 stdbuf 进行行缓冲
-    (
-        $STDBUF mpirun -np "$NP" "$VASP_BIN/$EXE" 2> >($STDBUF tee "$ERR" >&2) \
-            | $STDBUF tee "$OUT" \
-            | $STDBUF grep -E "(E0|F=|DAV|RMM|Error|error|WARNING|STOP)"
-        pipeline_status=("${PIPESTATUS[@]}")
-        echo "${pipeline_status[0]}" > "$MPIRUN_RC_FILE"
-    )
-else
-    # 无 stdbuf 回退
-    (
-        mpirun -np "$NP" "$VASP_BIN/$EXE" 2> >(tee "$ERR" >&2) \
-            | tee "$OUT" \
-            | grep -E "(E0|F=|DAV|RMM|Error|error|WARNING|STOP)"
-        pipeline_status=("${PIPESTATUS[@]}")
-        echo "${pipeline_status[0]}" > "$MPIRUN_RC_FILE"
-    )
+MPIRUN_OUT_FIFO="$TMP_ROOT/mpirun.stdout.fifo"
+MPIRUN_ERR_FIFO="$TMP_ROOT/mpirun.stderr.fifo"
+rm -f "$MPIRUN_OUT_FIFO" "$MPIRUN_ERR_FIFO"
+if ! mkfifo "$MPIRUN_OUT_FIFO" "$MPIRUN_ERR_FIFO"; then
+    echo "[ERROR] 无法创建 mpirun 日志管道"
+    exit 1
 fi
+register_tmp_path "$MPIRUN_OUT_FIFO"
+register_tmp_path "$MPIRUN_ERR_FIFO"
 
-# 读取 mpirun 返回码
-VASP_RC=1  # 默认失败
-if [[ -f "$MPIRUN_RC_FILE" ]]; then
-    VASP_RC=$(cat "$MPIRUN_RC_FILE" 2>/dev/null || echo 1)
-    rm -f "$MPIRUN_RC_FILE"
-fi
+(
+    run_with_stdbuf tee "$OUT" < "$MPIRUN_OUT_FIFO" \
+        | run_with_stdbuf awk '/(E0|F=|DAV|RMM|Error|error|WARNING|STOP)/ { print; fflush() }'
+) &
+OUT_LOGGER_PID=$!
 
-set -e
+run_with_stdbuf tee "$ERR" < "$MPIRUN_ERR_FIFO" >&2 &
+ERR_LOGGER_PID=$!
+
+run_with_stdbuf mpirun -np "$NP" "$VASP_BIN/$EXE" > "$MPIRUN_OUT_FIFO" 2> "$MPIRUN_ERR_FIFO"
+VASP_RC=$?
+
+wait "$OUT_LOGGER_PID"
+OUT_LOGGER_RC=$?
+wait "$ERR_LOGGER_PID"
+ERR_LOGGER_RC=$?
 
 END_TIME=$(date +%s)
 WALL_TIME=$((END_TIME - START_TIME))
@@ -729,10 +958,38 @@ echo "[run_vasp] 运行耗时: ${WALL_H}h ${WALL_M}m ${WALL_S}s (${WALL_TIME}s)"
     echo "结束时间: $(date '+%Y-%m-%d %H:%M:%S')"
     echo "运行耗时: ${WALL_H}h ${WALL_M}m ${WALL_S}s (${WALL_TIME}s)"
     echo "mpirun 返回码: $VASP_RC"
+    if [[ $OUT_LOGGER_RC -ne 0 ]]; then
+        echo "stdout logger 返回码: $OUT_LOGGER_RC"
+    fi
+    if [[ $ERR_LOGGER_RC -ne 0 ]]; then
+        echo "stderr logger 返回码: $ERR_LOGGER_RC"
+    fi
+} >> run.log
+
+if [[ $OUT_LOGGER_RC -ne 0 ]]; then
+    echo "[WARN] stdout 日志处理异常 (rc=$OUT_LOGGER_RC)"
+fi
+if [[ $ERR_LOGGER_RC -ne 0 ]]; then
+    echo "[WARN] stderr 日志处理异常 (rc=$ERR_LOGGER_RC)"
+fi
+
+CURRENT_RUN_OUTCAR_DONE=0
+if outcar_has_completion_marker_since OUTCAR "$OUTCAR_CHECK_START"; then
+    CURRENT_RUN_OUTCAR_DONE=1
+fi
+
+CURRENT_RUN_ACCEPTED=0
+if [[ $VASP_RC -eq 0 && $CURRENT_RUN_OUTCAR_DONE -eq 1 ]]; then
+    CURRENT_RUN_ACCEPTED=1
+fi
+
+{
+    echo "本轮完成标志: $CURRENT_RUN_OUTCAR_DONE"
+    echo "本轮接受状态: $CURRENT_RUN_ACCEPTED"
 } >> run.log
 
 # ---------------------- XDATCAR 轨迹合并 ----------------------
-if [[ -n "$XDATCAR_PREV" && -f "$XDATCAR_PREV" && -f "XDATCAR" ]]; then
+if [[ $CURRENT_RUN_ACCEPTED -eq 1 && -n "$XDATCAR_PREV" && -f "$XDATCAR_PREV" && -f "XDATCAR" ]]; then
     echo ""
     echo ">>> XDATCAR 轨迹合并..."
 
@@ -754,8 +1011,14 @@ if [[ -n "$XDATCAR_PREV" && -f "$XDATCAR_PREV" && -f "XDATCAR" ]]; then
         dedup_possible=0
     fi
 
-    prev_frame_tmp="/tmp/xdat_prev_frame_$$"
-    new_frame_tmp="/tmp/xdat_new_frame_$$"
+    prev_frame_tmp=$(mktemp "$TMP_ROOT/xdat_prev_frame.XXXXXX" 2>/dev/null || true)
+    new_frame_tmp=$(mktemp "$TMP_ROOT/xdat_new_frame.XXXXXX" 2>/dev/null || true)
+    if [[ -z "$prev_frame_tmp" || -z "$new_frame_tmp" ]]; then
+        dedup_possible=0
+    else
+        register_tmp_path "$prev_frame_tmp"
+        register_tmp_path "$new_frame_tmp"
+    fi
 
     if [[ $dedup_possible -eq 1 ]]; then
         if ! extract_xdatcar_last_frame "$XDATCAR_PREV" "$natoms" > "$prev_frame_tmp" 2>/dev/null; then
@@ -821,6 +1084,9 @@ if [[ -n "$XDATCAR_PREV" && -f "$XDATCAR_PREV" && -f "XDATCAR" ]]; then
     merged_lines=$(wc -l < XDATCAR)
     echo "[TRAJECTORY] 合并完成: $prev_lines + $new_lines -> $merged_lines 行"
     echo "XDATCAR 合并总行数: prev=$prev_lines, new=$new_lines, merged=$merged_lines" >> run.log
+elif [[ -n "$XDATCAR_PREV" && -f "$XDATCAR_PREV" && -f "XDATCAR" ]]; then
+    echo "[WARN] 本轮运行未通过完成检查，跳过 XDATCAR 合并以保护轨迹完整性"
+    echo "XDATCAR 合并已跳过: 本轮未被接受" >> run.log
 fi
 
 # ---------------------- 错误处理 ----------------------
@@ -846,29 +1112,40 @@ fi
 
 # ---------------------- 完成检查 ----------------------
 echo ""
-if [[ -f OUTCAR ]]; then
-    if grep -q "General timing and accounting informations for this job" OUTCAR; then
-        echo "[OK] VASP 计算正常完成。"
-        echo "状态: 正常完成" >> run.log
-        
-        # 提取总 CPU 时间
-        total_cpu=$(grep "Total CPU time used" OUTCAR | tail -1 || true)
-        if [[ -n "$total_cpu" ]]; then
-            echo "    $total_cpu"
-            echo "$total_cpu" >> run.log
-        fi
-    else
-        echo "[WARN] OUTCAR 存在但未找到正常完成标志，请检查计算是否中断。"
-        echo "状态: 未正常完成（可能中断）" >> run.log
+FINAL_RC=$VASP_RC
+if [[ $CURRENT_RUN_ACCEPTED -eq 1 ]]; then
+    echo "[OK] VASP 本轮计算正常完成。"
+    echo "状态: 正常完成" >> run.log
+
+    # 仅从本轮输出段提取 CPU 时间，避免读取旧续算段
+    total_cpu=$(awk -v from_line="$OUTCAR_CHECK_START" '
+        NR < from_line { next }
+        /Total CPU time used/ { line = $0 }
+        END { if (line != "") print line }
+    ' OUTCAR 2>/dev/null || true)
+    if [[ -n "$total_cpu" ]]; then
+        echo "    $total_cpu"
+        echo "$total_cpu" >> run.log
     fi
 else
-    echo "[WARN] OUTCAR 不存在，计算可能失败。"
-    echo "状态: 失败（无 OUTCAR）" >> run.log
+    if [[ $VASP_RC -eq 0 ]]; then
+        echo "[ERROR] mpirun 返回 0，但本轮 OUTCAR 未检测到完成标志。"
+        echo "状态: 失败（本轮无完成标志）" >> run.log
+        FINAL_RC=1
+    else
+        if [[ -f OUTCAR ]]; then
+            echo "[WARN] 本轮运行失败，且本轮 OUTCAR 段未通过完成检查。"
+            echo "状态: 失败（rc=$VASP_RC）" >> run.log
+        else
+            echo "[WARN] OUTCAR 不存在，计算可能失败。"
+            echo "状态: 失败（无 OUTCAR）" >> run.log
+        fi
+    fi
 fi
 
 echo "" >> run.log
-echo "[run_vasp] 完成。"
+echo "[run_vasp] 结束。"
 
-if [[ $VASP_RC -ne 0 ]]; then
-    exit "$VASP_RC"
+if [[ $FINAL_RC -ne 0 ]]; then
+    exit "$FINAL_RC"
 fi
